@@ -573,16 +573,22 @@ import sys
 
 json.loads(sys.stdin.readline())
 checkpoint = os.path.join(os.getcwd(), "README.md")
-failures = []
-for path in [checkpoint, os.environ["REVIEW_HOST_MARKER"]]:
+blocked = []
+def must_fail(name, mutation):
     try:
-        with open(path, "w", encoding="utf-8") as target:
-            target.write("reviewer mutation\n")
+        mutation()
     except OSError:
-        failures.append(path)
+        blocked.append(name)
+
+must_fail("overwrite-checkpoint", lambda: open(checkpoint, "w", encoding="utf-8"))
+must_fail("write-host", lambda: open(os.environ["REVIEW_HOST_MARKER"], "w", encoding="utf-8"))
+must_fail("create", lambda: open(os.path.join(os.getcwd(), "CREATED"), "w", encoding="utf-8"))
+must_fail("rename", lambda: os.rename(checkpoint, checkpoint + ".moved"))
+must_fail("delete", lambda: os.unlink(checkpoint))
+must_fail("chmod", lambda: os.chmod(checkpoint, 0o600))
 # A fingerprint taken after review cannot catch a temporary edit followed by restoration.
 # Opening the checkpoint read/write must fail before either operation can happen.
-try:
+def mutate_then_restore():
     with open(checkpoint, "r+", encoding="utf-8") as target:
         original = target.read()
         target.seek(0)
@@ -590,8 +596,7 @@ try:
         target.seek(0)
         target.write(original)
         target.truncate()
-except OSError:
-    failures.append("temporary-mutation-and-restoration")
+must_fail("temporary-mutation-and-restoration", mutate_then_restore)
 scratch = os.path.join(os.environ["TMPDIR"], "review-scratch")
 with open(scratch, "w", encoding="utf-8") as target:
     target.write("ephemeral\n")
@@ -599,7 +604,7 @@ print(json.dumps({"type":"message_end","message":{"content":"attempted mutations
 print(json.dumps({"type":"agent_settled"}), flush=True)
 assessment = json.loads(sys.stdin.readline())
 assert assessment["id"] == "review-assessment"
-result = {"mutation_attempts": 3, "blocked": len(failures), "private_scratch": os.path.isfile(scratch)}
+result = {"mutation_attempts": 7, "blocked": blocked, "private_scratch": os.path.isfile(scratch)}
 print(json.dumps({"type":"message_end","message":{"content":json.dumps(result)}}), flush=True)
 print(json.dumps({"type":"agent_settled"}), flush=True)
 "#,
@@ -674,7 +679,19 @@ print(json.dumps({"type":"agent_settled"}), flush=True)
 
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&output.text).unwrap(),
-        json!({"mutation_attempts": 3, "blocked": 3, "private_scratch": true})
+        json!({
+            "mutation_attempts": 7,
+            "blocked": [
+                "overwrite-checkpoint",
+                "write-host",
+                "create",
+                "rename",
+                "delete",
+                "chmod",
+                "temporary-mutation-and-restoration"
+            ],
+            "private_scratch": true
+        })
     );
     assert_eq!(
         tokio::fs::read_to_string(&checkpoint_file).await.unwrap(),

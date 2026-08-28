@@ -2076,11 +2076,7 @@ async fn run_pi(
         .arg(home.join(".pi/agent"));
     }
     let sandbox_cwd = if let Some(workspace) = &isolated {
-        let writable = matches!(
-            purpose,
-            SessionPurpose::Implementation | SessionPurpose::Validation | SessionPurpose::Recovery
-        );
-        cmd.arg(if writable { "--bind" } else { "--ro-bind" })
+        cmd.arg(project_mount_option(&purpose))
             .arg(&workspace.worktree_root)
             .arg(&workspace.primary_root);
         workspace.primary_cwd.clone()
@@ -2245,6 +2241,18 @@ async fn run_pi(
         text: final_text,
         observations,
     })
+}
+
+/// Select the worktree mount policy from an exhaustive purpose match. Review must remain an
+/// explicit read-only case rather than falling through a broad "work purposes are writable"
+/// classification.
+fn project_mount_option(purpose: &SessionPurpose) -> &'static str {
+    match purpose {
+        SessionPurpose::Implementation | SessionPurpose::Validation | SessionPurpose::Recovery => {
+            "--bind"
+        }
+        SessionPurpose::Intent | SessionPurpose::Inspection | SessionPurpose::Review => "--ro-bind",
+    }
 }
 
 fn observed_review_evidence(
