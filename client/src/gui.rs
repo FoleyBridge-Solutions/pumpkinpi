@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use dioxus::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use pumpkinpi_protocol::*;
@@ -80,6 +81,7 @@ struct PendingMessage {
     project_id: ProjectId,
     local_id: String,
     message: String,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +359,7 @@ impl GuiRuntime {
                 project_id: key.project_id.clone(),
                 local_id: Uuid::new_v4().to_string(),
                 message: message.clone(),
+                created_at: Utc::now().timestamp().try_into().unwrap_or_default(),
             });
             revision
         };
@@ -1155,10 +1158,19 @@ fn render_chat(
                     {render_timeline_item(item)}
                 }
                 for message in pending {
-                    article { class: "timeline-item user_intent pending-item", key: "{message.local_id}",
-                        div { class: "timeline-body",
-                            div { class: "timeline-meta", b { "You" } span { class: "pending-dot" } }
-                            div { class: "timeline-content", "{message.message}" }
+                    {
+                        let timestamp = format_local_timestamp(message.created_at);
+                        rsx! {
+                            article { class: "timeline-item user_intent pending-item", key: "{message.local_id}",
+                                div { class: "timeline-body",
+                                    div { class: "timeline-meta",
+                                        b { "You" }
+                                        time { datetime: "{timestamp}", "{timestamp}" }
+                                        span { class: "pending-dot" }
+                                    }
+                                    div { class: "timeline-content", "{message.message}" }
+                                }
+                            }
                         }
                     }
                 }
@@ -1205,6 +1217,24 @@ fn render_chat(
     }
 }
 
+fn format_timestamp<Tz: TimeZone>(timestamp: u64, timezone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let instant = i64::try_from(timestamp)
+        .ok()
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    instant
+        .with_timezone(timezone)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+fn format_local_timestamp(timestamp: u64) -> String {
+    format_timestamp(timestamp, &Local)
+}
+
 fn render_timeline_item(item: &TimelineItem) -> Element {
     let kind = enum_class(&item.kind);
     let actor = if item.kind == TimelineKind::UserIntent {
@@ -1226,6 +1256,8 @@ fn render_timeline_item(item: &TimelineItem) -> Element {
         .or(item.summary.as_deref())
         .unwrap_or("Update");
     let revision = item.source_of_intent_revision;
+    let timestamp = format_local_timestamp(item.created_at);
+    let cursor_diagnostic = format!("Timeline cursor {}", item.cursor);
 
     rsx! {
         article { class: "timeline-item {kind}", key: "{item.timeline_item_id}",
@@ -1233,7 +1265,7 @@ fn render_timeline_item(item: &TimelineItem) -> Element {
             div { class: "timeline-body",
                 div { class: "timeline-meta",
                     b { "{actor}" }
-                    time { "#{item.cursor}" }
+                    time { datetime: "{timestamp}", title: "{cursor_diagnostic}", "{timestamp}" }
                     if let Some(revision) = revision { span { class: "revision-tag", "intent r{revision}" } }
                 }
                 if item.summary.is_some() && item.content.is_some() {
@@ -1563,6 +1595,34 @@ where
                 .into(),
         ))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_timestamp;
+    use chrono::FixedOffset;
+
+    const FIXED_INSTANT: u64 = 1_704_164_645; // 2024-01-02 03:04:05 UTC
+
+    #[test]
+    fn timestamp_format_includes_positive_utc_offset() {
+        let timezone = FixedOffset::east_opt(5 * 60 * 60 + 30 * 60).unwrap();
+
+        assert_eq!(
+            format_timestamp(FIXED_INSTANT, &timezone),
+            "2024-01-02 08:34:05 +05:30"
+        );
+    }
+
+    #[test]
+    fn timestamp_format_includes_negative_utc_offset() {
+        let timezone = FixedOffset::west_opt(7 * 60 * 60).unwrap();
+
+        assert_eq!(
+            format_timestamp(FIXED_INSTANT, &timezone),
+            "2024-01-01 20:04:05 -07:00"
+        );
+    }
 }
 
 pub(crate) fn run() -> Result<()> {

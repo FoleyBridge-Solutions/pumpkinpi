@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+chrono = "0.4"
 dioxus = { version = "=0.8.0-alpha.1", default-features = false, features = ["macro", "html", "signals", "hooks"] }
 dioxus-native = { version = "=0.8.0-alpha.1", default-features = false, features = ["accessibility", "clipboard", "incremental", "scrollbars", "system-fonts", "vello-hybrid"] }
 futures-util.workspace = true
