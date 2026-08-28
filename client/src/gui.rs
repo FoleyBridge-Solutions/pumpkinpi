@@ -827,6 +827,12 @@ fn order_snapshot_collections(snapshot: &mut ProjectSnapshot) {
     snapshot
         .reviews
         .sort_by(|a, b| (a.created_at, &a.review_id).cmp(&(b.created_at, &b.review_id)));
+    snapshot
+        .divergences
+        .sort_by(|a, b| a.divergence_id.cmp(&b.divergence_id));
+    snapshot
+        .iteration_telemetry
+        .sort_by_key(|item| (item.recorded_at, item.iteration, item.operation_id.clone()));
 }
 
 fn merge_snapshot(old: &mut ProjectSnapshot, new: &ProjectSnapshot) {
@@ -844,6 +850,9 @@ fn merge_snapshot(old: &mut ProjectSnapshot, new: &ProjectSnapshot) {
     }
     old.operations = new.operations.clone();
     old.reviews = new.reviews.clone();
+    old.divergences = new.divergences.clone();
+    old.requirement_index = new.requirement_index.clone();
+    old.iteration_telemetry = new.iteration_telemetry.clone();
     old.gap_before = new.gap_before;
     order_snapshot_collections(old);
 }
@@ -1513,6 +1522,10 @@ fn render_inspector(
         .reviews
         .iter()
         .max_by(|a, b| (a.created_at, &a.review_id).cmp(&(b.created_at, &b.review_id)));
+    let latest_iteration = snapshot
+        .iteration_telemetry
+        .iter()
+        .max_by_key(|item| (item.recorded_at, item.iteration));
     let provider = snapshot
         .project
         .default_provider
@@ -1542,6 +1555,26 @@ fn render_inspector(
                     div { class: "context-card",
                         p { b { "{enum_class(&review.verdict)}" } " · revision {review.source_of_intent_revision}" }
                         p { {format!("{} finding(s) · {} required scope item(s) unreviewed", review.findings.len(), review.unreviewed_required_scope.len())} }
+                    }
+                }
+            }
+            section { class: "inspector-section",
+                h2 { "Convergence" }
+                div { class: "context-card",
+                    p { b { {format!("{} open divergence(s)", snapshot.divergences.len())} } }
+                    if let Some(index) = &snapshot.requirement_index {
+                        p { {format!("{} indexed requirement section(s) · revision {}", index.nodes.len(), index.source_of_intent_revision)} }
+                    }
+                    if let Some(iteration) = latest_iteration {
+                        p { {format!("Iteration {} · implementation {:.1}s · validation {:.1}s · review {:.1}s · {} new / {} verified / {} reopened",
+                            iteration.iteration,
+                            iteration.implementation_ms as f64 / 1000.0,
+                            iteration.validation_ms as f64 / 1000.0,
+                            iteration.review_ms as f64 / 1000.0,
+                            iteration.divergence_transitions.opened,
+                            iteration.divergence_transitions.verified,
+                            iteration.divergence_transitions.reopened,
+                        )} }
                     }
                 }
             }
@@ -1720,6 +1753,16 @@ where
         .await
 }
 
+pub(crate) fn run() -> Result<()> {
+    let window = dioxus_native::WindowAttributes::default()
+        .with_title("PumpkinPi")
+        .with_surface_size(dioxus_native::LogicalSize::new(1440.0, 900.0))
+        .with_min_surface_size(dioxus_native::LogicalSize::new(900.0, 620.0));
+    let config = dioxus_native::Config::new().with_window_attributes(window);
+    dioxus_native::launch_cfg(app, vec![], vec![Box::new(config)]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,6 +1879,9 @@ mod tests {
             timeline: vec![],
             operations: vec![],
             reviews: vec![],
+            divergences: vec![],
+            requirement_index: None,
+            iteration_telemetry: vec![],
             gap_before: None,
         }
     }
@@ -1942,14 +1988,4 @@ mod tests {
 
         assert_eq!(labels, ["item_first", "pending_middle", "item_later"]);
     }
-}
-
-pub(crate) fn run() -> Result<()> {
-    let window = dioxus_native::WindowAttributes::default()
-        .with_title("PumpkinPi")
-        .with_surface_size(dioxus_native::LogicalSize::new(1440.0, 900.0))
-        .with_min_surface_size(dioxus_native::LogicalSize::new(900.0, 620.0));
-    let config = dioxus_native::Config::new().with_window_attributes(window);
-    dioxus_native::launch_cfg(app, vec![], vec![Box::new(config)]);
-    Ok(())
 }

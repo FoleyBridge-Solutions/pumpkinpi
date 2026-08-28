@@ -237,6 +237,73 @@ Reviewer findings become durable divergences and feed the next implementation it
 
 The reviewer cannot make approval easier by weakening or rewriting the Source of Intent. Proposed intent changes return to Intent Chat as explicit proposals. Disputed, contradictory, or unevaluable findings trigger further inspection or an owner question rather than being silently discarded.
 
+## Convergence and Iteration Throughput
+
+Iteration throughput must be improved without narrowing active intent, skipping independent whole-Project review, treating cached claims as evidence, or converting a resource limit into success. Every implementation increment still ends in independent whole-Project review against the complete current Source of Intent. Optimization changes how knowledge and verified computation are carried forward, not what must be satisfied.
+
+### Derived requirement graph
+
+The Spoke compiles each exact Source of Intent revision into a disposable, content-addressed requirement graph. Every node has a stable ID, exact source document and line range, source hash, kind, dependencies where known, and acceptance criteria where present. The authoritative document bytes remain canonical; the graph never replaces, weakens, or resolves ambiguity in them. A node must be traceable to exact source bytes, graph generation is keyed by the complete Source hash, and any graph omission leaves scope unreviewed rather than deleting the requirement.
+
+Agents may use the graph to avoid repeatedly rediscovering document structure. Approval still requires complete path/hash coverage of the authoritative bundle and an assessment of every applicable requirement node.
+
+### Durable divergence ledger
+
+Reviewer findings reconcile into a Spoke-authoritative divergence ledger rather than becoming an unrelated prose list on every iteration. A divergence records a stable ID and fingerprint, governing requirement IDs, affected components, first and latest observed reality versions, state, attempt and reopen counts, evidence, verification criteria, and suggested objectives.
+
+The lifecycle is:
+
+```text
+open -> addressed -> verified
+  ^          |          |
+  |          v          v
+  +------- reopened <- regression
+```
+
+The Spoke matches findings to existing divergences by stable requirement identity and normalized fault identity, retains history, rejects duplicate identities within one review, and records unmatched complete-review findings as new. Absence from an incomplete review never closes a divergence. A complete current review may verify a previously open divergence as absent; whole-Project satisfaction still requires the separate zero-finding approval rules.
+
+Each iteration reports opened, still-open, verified, and reopened counts. Finding wording or ordering must not erase history. Repeated or reopened divergences trigger root-cause analysis rather than indefinite local patching.
+
+### Convergence-oriented bounded objectives
+
+Bounded does not mean one finding. The orchestrator selects a coherent objective package from the ledger when findings share a subsystem, root cause, schema migration, security boundary, dependency, or validation fixture. The package remains small enough to implement and validate coherently, but should maximize requirements unblocked, divergences closed, risk reduced, and reusable evidence gained.
+
+Objective selection is Spoke-controlled and records its divergence IDs, requirements, scope, validation criteria, authorization basis, and rationale. The implementation Run may propose a safer decomposition but may not silently discard assigned divergences. Reopened findings and architectural blockers receive higher priority. Every resulting checkpoint still receives independent whole-Project review.
+
+### Content-addressed observations and evidence reuse
+
+Project reality is indexed by file, symlink, directory, checkpoint, toolchain, command, environment, and relevant external-input hashes. Previously captured evidence may be reused only when its complete validity key is unchanged, its producer and capture metadata remain available, and the current independent reviewer explicitly accepts its applicability. Changed or uncertain inputs invalidate the evidence. Arbitrary Run prose is never reusable evidence.
+
+Reuse does not make review partial: every requirement must bind either to a current observation, still-valid content-addressed evidence, or explicit unreviewed scope that prohibits approval. Security-sensitive checks and final approval policy may require fresh reviewer-originated execution even when equivalent cached evidence exists.
+
+### Validation execution and assessment
+
+Known deterministic validation obligations are issued by the Spoke and executed by a supervised validation executor. It records the exact command, working directory, environment and toolchain fingerprint, start and finish times, exit status, signal, cancellation, output digest, retained output, and checkpoint. Independent validation or review agents assess this evidence and may request additional checks; they need not spend a model turn merely waiting for a known command.
+
+Implementation, validation, and review must not unknowingly repeat an identical expensive command for the same validity key. Deliberate independent reruns remain permitted and are required where policy says execution provenance is material. Validation commands may be scheduled concurrently only when declared resource locks and isolation make their results deterministic.
+
+### Persistent independent role Sessions
+
+A realization operation maintains resumable role-specific Pi Sessions for implementation and review. Reviewer state is never shared with the implementer. Sessions retain repository understanding, prior attempts, and compacted typed state across iterations, with every retained observation bound to the Source revision and Project hash that made it valid. Restart restores the durable typed state and revalidates bindings before reuse.
+
+Reviewer independence does not require amnesia. A warm reviewer may retain the previous complete assessment and ledger, but final approval requires a cold complete review, or another policy-defined independent approval quorum, to counter anchoring and accumulated blind spots. Review Sessions are rotated after intent changes, material policy changes, context integrity failures, or configured risk triggers.
+
+### Complete review coordination
+
+Whole-Project review may be partitioned into concurrent requirement domains when a Spoke-controlled coordinator proves complete, non-overlapping-or-explicitly-overlapping coverage and reconciles cross-domain findings. Parallel subreviewers are all read-only and independent from implementation. Their aggregate cannot approve unless every requirement and issued obligation is covered, all findings are reconciled, and no required scope remains unreviewed.
+
+Intermediate reviews emphasize changed impact, previous divergence verification, and complete requirement coverage. Approval review is cold and exhaustive. Both remain whole-Project reviews and both can discover faults anywhere; the distinction changes attention and evidence freshness policy, not satisfaction semantics.
+
+### Build and tool cache policy
+
+Situated execution may use bounded content-addressed build caches shared across isolated worktrees. Cache identity includes Project, toolchain, lockfile, target, profile, features, relevant environment, and policy version. Cache contents are never promoted as Project source, cannot bypass validation, and are discarded when identity is uncertain. The Spoke enforces size and retention limits and removes caches and worktrees belonging only to terminal superseded operations.
+
+### Iteration telemetry and non-convergence
+
+The Spoke durably records phase wall time, model and tool time, provider usage where available, prompt/context bytes, cache hits, commands, build time, changed files, checkpoint, and divergence transitions. Telemetry is diagnostic evidence, not satisfaction evidence, and secrets are redacted before persistence or transport.
+
+The orchestrator detects non-convergence such as repeated findings, reopened faults, validation oscillation, high-cost iterations with no verified divergence, or repeated edits to the same boundary. It responds by selecting root-cause work, changing decomposition, rotating an independent reviewer, obtaining missing inspection, or asking the owner about contradictory intent. It never responds by declaring success, suppressing findings, or silently reducing complete review.
+
 ## Satisfaction Semantics
 
 Satisfaction is an evidence-backed assessment, not a status inferred from operation completion.

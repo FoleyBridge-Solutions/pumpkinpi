@@ -134,6 +134,7 @@ pub(crate) fn implementation_prompt(
     source: &str,
     iteration: u64,
     findings: &[ReviewFindingProposal],
+    convergence_context: &str,
     authoritative_manifest: &str,
 ) -> String {
     let findings = serde_json::to_string_pretty(findings).unwrap_or_else(|_| "[]".into());
@@ -156,7 +157,12 @@ AUTHORITATIVE DOCUMENT BUNDLE:
 {authoritative_manifest}
 
 CURRENT REVIEW FINDINGS:
-{findings}"#
+{findings}
+
+SPOKE-AUTHORITATIVE CONVERGENCE CONTEXT:
+{convergence_context}
+
+Select one coherent bounded objective package. Prefer a shared root cause that closes multiple assigned divergences, prioritize reopened and repeatedly attempted divergences, and state which divergence IDs the objective addresses. Do not discard assigned divergences merely because only one can be completed in this iteration."#
     )
 }
 
@@ -167,10 +173,13 @@ pub(crate) fn review_prompt(
     implementation: &ImplementationRunResult,
     authoritative_manifest: &str,
     obligations: &[ReviewObligation],
+    prevalidated_evidence: &[ObservedReviewEvidence],
 ) -> String {
     let implementation =
         serde_json::to_string_pretty(implementation).unwrap_or_else(|_| "{}".into());
     let obligations = serde_json::to_string_pretty(obligations).unwrap_or_else(|_| "[]".into());
+    let prevalidated_evidence =
+        serde_json::to_string_pretty(prevalidated_evidence).unwrap_or_else(|_| "[]".into());
     format!(
         r#"You are PumpkinPi's independent whole-Project reviewer. You did not implement this iteration. Inspect the complete current project using read-only tools and assess it against every applicable part of the complete Source of Intent, not only the latest diff.
 
@@ -183,12 +192,17 @@ This is the evidence-capture phase. Perform all inspection and validation tool w
 On the second turn, return ONLY one JSON object with this schema:
 {{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"obligation_observations":[{{"obligation_id":string,"evidence_id":string}}],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
 
-The Spoke issued the obligations below before this Run. For approval, perform every exact required read or command. A file obligation requires an unbounded read from line 1. Put every obligation_id exactly once in reviewed_scope; put every exact obligation subject in checks; put every captured durable sha256 evidence ID in evidence; and map each obligation to its own successful event in obligation_observations. One event cannot satisfy multiple obligations. Output text, copied coverage, arbitrary scope prose, partial reads, and unissued checks cannot establish approval. Findings may continue to cite descriptive evidence.
+The Spoke issued the obligations below before this Run. For approval, perform every exact required file read and command not already represented by successful content-addressed Spoke evidence below. Reused file evidence is valid only because the Spoke matched its captured bytes to the current obligation hash; assess it in the persistent independent reviewer context. A file obligation without such evidence requires an unbounded read from line 1. Put every obligation_id exactly once in reviewed_scope; put every exact obligation subject in checks; put every captured durable sha256 evidence ID in evidence; and map each obligation to its own successful event in obligation_observations. One event cannot satisfy multiple obligations. Output text, copied coverage, arbitrary scope prose, partial reads, and unissued checks cannot establish approval. Findings may continue to cite descriptive evidence.
 
 Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, unchanged Project reality, and complete obligation evidence. Use verdict "approved" only when every issued obligation is satisfied, findings and unreviewed_required_scope are empty, and the corroborated evidence supports finding no fault in Project reality against this entire intent revision.
 
 SPOKE-ISSUED REVIEW OBLIGATIONS:
 {obligations}
+
+SPOKE-CAPTURED CURRENT OR CONTENT-ADDRESSED EVIDENCE:
+{prevalidated_evidence}
+
+Obligations already represented by successful applicable Spoke evidence do not need to be rerun. Assess their output and bind them in the final result. Failed, cancelled, or missing validation remains a finding or unreviewed required scope and prohibits approval.
 
 SOURCE OF INTENT revision {revision}:
 {source}
@@ -246,6 +260,7 @@ mod tests {
                 evidence: vec![],
                 obligation_observations: vec![],
                 findings: vec![ReviewFindingProposal {
+                    requirement_ids: vec![],
                     requirement: "durable replay".into(),
                     fault: "restart loses cursor".into(),
                     evidence: vec!["recovery test failed".into()],
@@ -301,6 +316,7 @@ mod tests {
                     evidence: vec![],
                     obligation_observations: vec![],
                     findings: vec![ReviewFindingProposal {
+                        requirement_ids: vec![],
                         requirement: "still exact".into(),
                         fault: format!("fault {expected_iteration}"),
                         evidence: vec!["review evidence".into()],

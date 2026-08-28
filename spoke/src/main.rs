@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -24,6 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, warn};
 use uuid::Uuid;
 
+mod convergence;
 mod orchestrator;
 mod source_bundle;
 mod workspace;
@@ -82,9 +83,17 @@ struct Store {
     #[serde(default)]
     review_evidence: BTreeMap<RunId, Vec<ObservedReviewEvidence>>,
     #[serde(default)]
+    pending_review_evidence: BTreeMap<OperationId, Vec<ObservedReviewEvidence>>,
+    #[serde(default)]
     workspaces: BTreeMap<OperationId, workspace::WorkspaceRecord>,
     #[serde(default)]
     realizations: BTreeMap<OperationId, orchestrator::RealizationMachine>,
+    #[serde(default)]
+    requirement_indexes: BTreeMap<ProjectId, RequirementIndex>,
+    #[serde(default)]
+    divergences: BTreeMap<DivergenceId, DivergenceRecord>,
+    #[serde(default)]
+    iteration_telemetry: Vec<IterationTelemetry>,
 }
 const INTERNAL_RESUME_MESSAGE: &str = "__pumpkinpi_internal_resume_active_realization_v3__";
 
@@ -103,6 +112,10 @@ struct ObservedReviewEvidence {
     #[serde(default)]
     complete: bool,
     successful: bool,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    cancelled: bool,
     observed_at: u64,
 }
 
@@ -626,6 +639,11 @@ async fn handle_inner(
                     .retain(|_, session| session.project_id != project_id);
                 s.reviews
                     .retain(|_, review| review.project_id != project_id);
+                s.requirement_indexes.remove(&project_id);
+                s.divergences
+                    .retain(|_, divergence| divergence.project_id != project_id);
+                s.iteration_telemetry
+                    .retain(|item| item.project_id != project_id);
                 s.workspaces
                     .retain(|_, workspace| workspace.project_id != project_id);
                 let remaining_workspaces = s.workspaces.keys().cloned().collect::<BTreeSet<_>>();
@@ -1057,6 +1075,15 @@ async fn run_operation(
             src.updated_at = now();
             revision = src.revision;
             active = update.activate;
+            s.requirement_indexes.remove(&pid);
+            for divergence in s
+                .divergences
+                .values_mut()
+                .filter(|item| item.project_id == pid && item.source_of_intent_revision != revision)
+            {
+                divergence.state = DivergenceState::Superseded;
+                divergence.updated_at = now();
+            }
             let chat = s.chats.get_mut(&pid).context("chat missing")?;
             chat.source_of_intent_revision = revision;
             chat.status = if active {
@@ -1217,8 +1244,37 @@ async fn run_operation(
         if let Some(bundle) = &current_source.authoritative_bundle {
             source_bundle::verify_on_disk(Path::new(&execution_project.cwd), bundle)?;
         }
+        let requirement_index = convergence::compile_requirement_index(&current_source, now());
+        let open_divergences = {
+            let mut store = state.store.lock().await;
+            let stale_index = store
+                .requirement_indexes
+                .get(&pid)
+                .is_none_or(|index| index.source_content_hash != current_source.content_hash);
+            if stale_index {
+                store
+                    .requirement_indexes
+                    .insert(pid.clone(), requirement_index.clone());
+                save_store(&state.data_dir, &store).await?;
+            }
+            convergence::open_for_prompt(&pid, machine.revision, &store.divergences)
+        };
+        let convergence_context = serde_json::to_string_pretty(&json!({
+            "requirement_graph": {
+                "source_hash": requirement_index.source_content_hash,
+                "nodes": requirement_index.nodes.iter().map(|node| json!({
+                    "requirement_id": node.requirement_id,
+                    "document": node.document_path,
+                    "heading": node.heading,
+                    "lines": [node.start_line, node.end_line],
+                    "source_hash": node.source_hash,
+                })).collect::<Vec<_>>(),
+            },
+            "open_divergences": open_divergences,
+        }))?;
         let authoritative_manifest =
             source_bundle::manifest_for_prompt(current_source.authoritative_bundle.as_ref());
+        let iteration_started = Instant::now();
         set_realization_status(&state, &pid, RealizationStatus::Reconciling).await?;
         let progress = append_item(
             &state,
@@ -1243,8 +1299,11 @@ async fn run_operation(
             &current_source.canonical_payload,
             machine.iteration,
             &machine.findings,
+            &convergence_context,
             &authoritative_manifest,
         );
+        let implementation_prompt_bytes = prompt.len() as u64;
+        let implementation_started = Instant::now();
         let (_, raw, _) = match run_internal(
             &state,
             &tx,
@@ -1264,6 +1323,7 @@ async fn run_operation(
                 return Err(error);
             }
         };
+        let implementation_ms = implementation_started.elapsed().as_millis() as u64;
         let implementation: ImplementationRunResult = match serde_json::from_str(raw.trim()) {
             Ok(result) => result,
             Err(error) => {
@@ -1291,7 +1351,9 @@ async fn run_operation(
             ));
         }
         machine.implementation_completed(&implementation)?;
-        workspace::checkpoint(&mut isolated, machine.iteration).await?;
+        let checkpoint_started = Instant::now();
+        let checkpoint_changed = workspace::checkpoint(&mut isolated, machine.iteration).await?;
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis() as u64;
         persist_workspace(&state, isolated.clone()).await?;
         persist_realization(&state, &opid, machine.clone()).await?;
 
@@ -1340,6 +1402,29 @@ async fn run_operation(
             machine.revision,
             &before_review,
         )?;
+        let build_cache = state.data_dir.join("build-cache").join(&pid.0);
+        let validation_started = Instant::now();
+        let validation_evidence = execute_validation_obligations(
+            &execution_project,
+            Path::new(&execution_project.cwd),
+            &build_cache,
+            &review_obligations,
+        )
+        .await;
+        let validation_ms = validation_started.elapsed().as_millis() as u64;
+        let reusable_file_evidence = {
+            let store = state.store.lock().await;
+            reusable_review_file_evidence(&store, &review_obligations)
+        };
+        let mut prevalidated_evidence = validation_evidence.clone();
+        prevalidated_evidence.extend(reusable_file_evidence);
+        {
+            let mut store = state.store.lock().await;
+            store
+                .pending_review_evidence
+                .insert(opid.clone(), prevalidated_evidence.clone());
+            save_store(&state.data_dir, &store).await?;
+        }
         let prompt = orchestrator::review_prompt(
             machine.revision,
             &before_review,
@@ -1347,7 +1432,10 @@ async fn run_operation(
             &implementation,
             &authoritative_manifest,
             &review_obligations,
+            &prevalidated_evidence,
         );
+        let mut review_prompt_bytes = prompt.len() as u64;
+        let review_started = Instant::now();
         let (review_run_id, raw, review_evidence) = run_internal(
             &state,
             &tx,
@@ -1360,6 +1448,7 @@ async fn run_operation(
             &provider_env,
         )
         .await?;
+        let mut review_ms = review_started.elapsed().as_millis() as u64;
         if let Some(bundle) = &current_source.authoritative_bundle
             && source_bundle::verify_on_disk(Path::new(&execution_project.cwd), bundle).is_err()
         {
@@ -1391,6 +1480,106 @@ async fn run_operation(
             &review,
         )
         .await?;
+        // A warm reviewer may carry useful history, but cannot grant final approval alone. An
+        // approval candidate is assessed again in a distinct cold role Session with no shared
+        // reviewer context. Any cold finding returns to the ordinary realization loop.
+        let (record, review) = if record.verdict == ReviewVerdict::Approved {
+            {
+                let mut store = state.store.lock().await;
+                store
+                    .pending_review_evidence
+                    .insert(opid.clone(), validation_evidence.clone());
+                save_store(&state.data_dir, &store).await?;
+            }
+            let cold_base_prompt = orchestrator::review_prompt(
+                machine.revision,
+                &before_review,
+                &current_source.canonical_payload,
+                &implementation,
+                &authoritative_manifest,
+                &review_obligations,
+                &validation_evidence,
+            );
+            let cold_prompt = format!(
+                "COLD APPROVAL REVIEW: You have no authority to rely on a prior reviewer approval or reused file observations. Freshly inspect every required Project and authoritative file. Perform the complete independent review and approve only from the current Source, Project reality, and evidence.\n\n{cold_base_prompt}"
+            );
+            review_prompt_bytes += cold_prompt.len() as u64;
+            let cold_started = Instant::now();
+            let (cold_run_id, cold_raw, cold_evidence) = run_internal(
+                &state,
+                &tx,
+                &execution_project,
+                &opid,
+                SessionPurpose::ApprovalReview,
+                Some(machine.revision),
+                &cold_prompt,
+                cancel.clone(),
+                &provider_env,
+            )
+            .await?;
+            review_ms += cold_started.elapsed().as_millis() as u64;
+            let after_cold_review =
+                project_fingerprint(PathBuf::from(&execution_project.cwd)).await?;
+            if after_cold_review != before_review {
+                workspace::rollback(&isolated).await?;
+                return Err(anyhow!(
+                    "cold approval reviewer mutated isolated Project reality; changes were rolled back"
+                ));
+            }
+            let cold_review: ReviewRunResult = serde_json::from_str(cold_raw.trim())
+                .context("cold approval Review violated its typed contract")?;
+            cold_review.validate().map_err(anyhow::Error::msg)?;
+            let cold_record = persist_review(
+                &state,
+                &pid,
+                cold_run_id,
+                machine.revision,
+                Path::new(&execution_project.cwd),
+                &before_review,
+                &review_obligations,
+                &cold_evidence,
+                &cold_review,
+            )
+            .await?;
+            (cold_record, cold_review)
+        } else {
+            (record, review)
+        };
+        let divergence_transitions = {
+            let mut store = state.store.lock().await;
+            let transitions = convergence::reconcile(
+                &pid,
+                machine.revision,
+                &before_review,
+                &review.findings,
+                &requirement_index,
+                &mut store.divergences,
+                now(),
+            );
+            store.iteration_telemetry.push(IterationTelemetry {
+                project_id: pid.clone(),
+                operation_id: opid.clone(),
+                source_of_intent_revision: machine.revision,
+                iteration: machine.iteration,
+                implementation_ms,
+                validation_ms,
+                review_ms,
+                checkpoint_ms,
+                total_ms: iteration_started.elapsed().as_millis() as u64,
+                implementation_prompt_bytes,
+                review_prompt_bytes,
+                changed: checkpoint_changed,
+                divergence_transitions: transitions.clone(),
+                recorded_at: now(),
+            });
+            // Keep bounded diagnostics while preserving all telemetry for active operations.
+            if store.iteration_telemetry.len() > 10_000 {
+                let remove = store.iteration_telemetry.len() - 10_000;
+                store.iteration_telemetry.drain(..remove);
+            }
+            save_store(&state.data_dir, &store).await?;
+            transitions
+        };
         machine.review_completed(review)?;
         persist_realization(&state, &opid, machine.clone()).await?;
 
@@ -1435,8 +1624,12 @@ async fn run_operation(
             Some(opid.clone()),
             TimelineKind::Evidence,
             Some(format!(
-                "Review found {} fault(s); continuing",
-                record.findings.len()
+                "Review found {} fault(s); continuing ({} new, {} still open, {} verified, {} reopened)",
+                record.findings.len(),
+                divergence_transitions.opened,
+                divergence_transitions.still_open,
+                divergence_transitions.verified,
+                divergence_transitions.reopened,
             )),
             Some(content),
             Some(OperationStatus::Running),
@@ -1656,6 +1849,14 @@ fn corroborate_approval(
                     "validation obligation requires its exact bash command"
                 ));
             }
+            ReviewObligationKind::ValidationCommand
+                if item.exit_code != Some(0) || item.cancelled || !item.successful =>
+            {
+                return Err(anyhow!(
+                    "validation obligation requires a completed zero-exit command: {}",
+                    obligation.subject
+                ));
+            }
             ReviewObligationKind::ValidationCommand => {}
         }
     }
@@ -1740,11 +1941,13 @@ async fn persist_review(
     };
     store
         .review_evidence
-        .insert(run_id, observed_evidence.to_vec());
+        .insert(run_id.clone(), observed_evidence.to_vec());
     store
         .reviews
         .insert(record.review_id.clone(), record.clone());
     save_store(&state.data_dir, &store).await?;
+    drop(store);
+    remove_review_evidence_journal(&state.data_dir, &run_id).await;
     Ok(record)
 }
 
@@ -1944,6 +2147,170 @@ fn issue_review_obligations(
     Ok(obligations)
 }
 
+fn reusable_review_file_evidence(
+    store: &Store,
+    obligations: &[ReviewObligation],
+) -> Vec<ObservedReviewEvidence> {
+    let mut reusable = Vec::new();
+    let mut used = BTreeSet::new();
+    for obligation in obligations.iter().filter(|item| {
+        matches!(
+            item.kind,
+            ReviewObligationKind::AuthoritativeDocument | ReviewObligationKind::ProjectFile
+        )
+    }) {
+        let Some(expected_hash) = obligation.expected_content_hash.as_deref() else {
+            continue;
+        };
+        let candidate = store
+            .review_evidence
+            .values()
+            .flat_map(|items| items.iter())
+            .filter(|item| {
+                item.successful
+                    && item.complete
+                    && item.tool_name == "read"
+                    && item.subject == obligation.subject
+                    && item.observed_content_hash.as_deref() == Some(expected_hash)
+                    && !used.contains(&item.evidence_id)
+            })
+            .max_by_key(|item| item.observed_at)
+            .cloned();
+        if let Some(candidate) = candidate {
+            used.insert(candidate.evidence_id.clone());
+            reusable.push(candidate);
+        }
+    }
+    reusable
+}
+
+/// Execute deterministic review validation obligations under Spoke control. The independent
+/// reviewer assesses these results and may request additional checks, but does not waste a model
+/// turn merely waiting for commands whose identity was fixed before review.
+async fn execute_validation_obligations(
+    project: &ProjectRecord,
+    root: &Path,
+    build_cache: &Path,
+    obligations: &[ReviewObligation],
+) -> Vec<ObservedReviewEvidence> {
+    let _ = tokio::fs::create_dir_all(build_cache).await;
+    let mut evidence = Vec::new();
+    for obligation in obligations
+        .iter()
+        .filter(|item| item.kind == ReviewObligationKind::ValidationCommand)
+    {
+        let started = now();
+        let mut command = Command::new("bwrap");
+        command.args([
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup-try",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+        ]);
+        command
+            .arg("--bind")
+            .arg(root)
+            .arg(root)
+            .arg("--bind")
+            .arg(build_cache)
+            .arg(build_cache)
+            .arg("--chdir")
+            .arg(root)
+            .arg("--")
+            .arg("bash")
+            .arg("-lc")
+            .arg(&obligation.subject)
+            .current_dir("/")
+            .env("TMPDIR", "/tmp")
+            .env("CARGO_TERM_COLOR", "never")
+            .env("CARGO_TARGET_DIR", build_cache);
+        let output = match apply_identity(&mut command, project.run_as_user.as_deref()) {
+            Ok(()) => command.output().await,
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        };
+        let (successful, exit_code, output_text) = match output {
+            Ok(output) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                (output.status.success(), output.status.code(), text)
+            }
+            Err(error) => (false, None, format!("validation executor failed: {error}")),
+        };
+        let output_lines = output_text
+            .lines()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let canonical = json!({
+            "obligation_id": obligation.obligation_id,
+            "command": obligation.subject,
+            "cwd": root,
+            "exit_code": exit_code,
+            "successful": successful,
+            "cancelled": false,
+            "output_sha256": hex::encode(Sha256::digest(output_text.as_bytes())),
+        });
+        evidence.push(ObservedReviewEvidence {
+            evidence_id: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(canonical.to_string()))
+            ),
+            tool_call_id: format!("spoke-validation:{}", obligation.obligation_id),
+            tool_name: "bash".into(),
+            subject: obligation.subject.clone(),
+            args: json!({"command": obligation.subject}),
+            output_lines,
+            observed_content_hash: None,
+            complete: true,
+            successful,
+            exit_code,
+            cancelled: false,
+            observed_at: started,
+        });
+    }
+    evidence
+}
+
+fn role_session_id(
+    operation: &OperationId,
+    purpose: &SessionPurpose,
+    run_id: Option<&RunId>,
+) -> String {
+    let cold_nonce = if *purpose == SessionPurpose::ApprovalReview {
+        run_id.map(|id| id.0.as_str()).unwrap_or("cold-approval")
+    } else {
+        "persistent-role"
+    };
+    let digest = Sha256::digest(format!(
+        "pumpkinpi\0{}\0{:?}\0{cold_nonce}",
+        operation.0, purpose
+    ));
+    // Pi requires an exact UUID. Set RFC 4122 variant/version bits while deriving the identity
+    // deterministically from the operation and independent role.
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_internal(
     state: &State,
@@ -1974,7 +2341,7 @@ async fn run_internal(
                 status: SessionStatus::Running,
                 run_as_user: project.run_as_user.clone(),
                 run_as_root: false,
-                pi_session_file: None,
+                pi_session_file: Some(role_session_id(operation, &purpose, Some(&run_id))),
                 created_at: n,
                 updated_at: n,
             },
@@ -2041,6 +2408,23 @@ async fn run_pi(
         .await
         .context("failed to create private Pi scratch mountpoint")?;
 
+    let role_session_dir = state
+        .data_dir
+        .join("pi-sessions")
+        .join(&operation.0)
+        .join(format!("{:?}", purpose).to_ascii_lowercase());
+    tokio::fs::create_dir_all(&role_session_dir)
+        .await
+        .context("failed to create persistent role Session directory")?;
+    let role_session_id = role_session_id(operation, &purpose, Some(run_id));
+    let build_cache = state
+        .data_dir
+        .join("build-cache")
+        .join(&project.project_id.0);
+    tokio::fs::create_dir_all(&build_cache)
+        .await
+        .context("failed to create Project build cache")?;
+
     let mut cmd = Command::new("bwrap");
     cmd.args([
         "--die-with-parent",
@@ -2060,14 +2444,20 @@ async fn run_pi(
         "/proc",
     ]);
     // Keep scratch writes ephemeral and scoped to this Run. In particular, never expose the
-    // host's shared /tmp as writable to a reviewer.
+    // host's shared /tmp as writable to a reviewer. The only persistent reviewer write surface is
+    // its own role Session, never the Project or the implementer's context.
     cmd.arg("--tmpfs").arg(&sandbox_tmp);
+    cmd.arg("--bind")
+        .arg(&role_session_dir)
+        .arg(&role_session_dir);
+    cmd.arg("--bind").arg(&build_cache).arg(&build_cache);
+    cmd.env("CARGO_TARGET_DIR", &build_cache);
     cmd.env("TMPDIR", &sandbox_tmp);
     if let Some(agent) = &isolated_agent {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .context("HOME is required")?;
-        cmd.arg(if purpose == SessionPurpose::Review {
+        cmd.arg(if is_review_purpose(&purpose) {
             "--ro-bind"
         } else {
             "--bind"
@@ -2089,7 +2479,12 @@ async fn run_pi(
         .arg(&pi_binary)
         .arg("--mode")
         .arg("rpc")
-        .arg("--no-session")
+        .arg("--session-dir")
+        .arg(&role_session_dir)
+        .arg("--session-id")
+        .arg(&role_session_id)
+        .arg("--name")
+        .arg(format!("PumpkinPi {:?} {}", purpose, operation.0))
         .current_dir("/")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2133,7 +2528,17 @@ async fn run_pi(
     stdin.flush().await?;
     let mut lines = BufReader::new(stdout).lines();
     let mut final_text = String::new();
-    let mut observations = Vec::new();
+    let mut observations = if is_review_purpose(&purpose) {
+        state
+            .store
+            .lock()
+            .await
+            .pending_review_evidence
+            .remove(operation)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut assessment_requested = false;
     let mut pending_tools: HashMap<String, (String, serde_json::Value)> = HashMap::new();
     loop {
@@ -2197,16 +2602,14 @@ async fn run_pi(
                     && let Some((tool_name, args)) = pending_tools.remove(id)
                     && let Some(observation) = observed_review_evidence(&v, tool_name, args)
                 {
-                    observations.push(observation);
-                    if purpose == SessionPurpose::Review {
-                        let mut store = state.store.lock().await;
-                        store.review_evidence.insert(run_id.clone(), observations.clone());
-                        save_store(&state.data_dir, &store).await?;
+                    if is_review_purpose(&purpose) {
+                        append_review_evidence_journal(&state.data_dir, run_id, &observation).await?;
                     }
+                    observations.push(observation);
                 }
                 if event_type == "message_end" && let Some(t) = message_content(&v) { final_text = t }
                 if event_type == "agent_settled" {
-                    if purpose == SessionPurpose::Review && !assessment_requested {
+                    if is_review_purpose(&purpose) && !assessment_requested {
                         let assessment_prompt = orchestrator::review_assessment_prompt(&observations);
                         stdin.write_all(
                             format!(
@@ -2225,7 +2628,9 @@ async fn run_pi(
             }
         }
     }
-    // RPC mode is persistent; this helper owns a one-operation process.
+    // The process is one-Run scoped, while Pi persists the role Session in the isolated session
+    // directory so the next iteration resumes compacted context without sharing reviewer and
+    // implementer memory.
     let _ = child.kill().await;
     let status = child.wait().await?;
     let stderr_tail = stderr_task.await.unwrap_or_default();
@@ -2246,12 +2651,22 @@ async fn run_pi(
 /// Select the worktree mount policy from an exhaustive purpose match. Review must remain an
 /// explicit read-only case rather than falling through a broad "work purposes are writable"
 /// classification.
+fn is_review_purpose(purpose: &SessionPurpose) -> bool {
+    matches!(
+        purpose,
+        SessionPurpose::Review | SessionPurpose::ApprovalReview
+    )
+}
+
 fn project_mount_option(purpose: &SessionPurpose) -> &'static str {
     match purpose {
         SessionPurpose::Implementation | SessionPurpose::Validation | SessionPurpose::Recovery => {
             "--bind"
         }
-        SessionPurpose::Intent | SessionPurpose::Inspection | SessionPurpose::Review => "--ro-bind",
+        SessionPurpose::Intent
+        | SessionPurpose::Inspection
+        | SessionPurpose::Review
+        | SessionPurpose::ApprovalReview => "--ro-bind",
     }
 }
 
@@ -2311,6 +2726,16 @@ fn observed_review_evidence(
         complete,
         successful: !event
             .get("isError")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        exit_code: result
+            .get("details")
+            .and_then(|details| details.get("exitCode").or_else(|| details.get("exit_code")))
+            .and_then(|value| value.as_i64())
+            .map(|value| value as i32),
+        cancelled: result
+            .get("details")
+            .and_then(|details| details.get("cancelled"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
         observed_at: now(),
@@ -2450,6 +2875,14 @@ async fn snapshot(state: &State, pid: &ProjectId, cursor: Option<u64>) -> Result
         timeline,
         operations,
         reviews,
+        divergences: convergence::open_for_prompt(pid, s.sources[pid].revision, &s.divergences),
+        requirement_index: s.requirement_indexes.get(pid).cloned(),
+        iteration_telemetry: s
+            .iteration_telemetry
+            .iter()
+            .filter(|item| &item.project_id == pid)
+            .cloned()
+            .collect(),
         gap_before: gap,
     })
 }
@@ -2613,6 +3046,30 @@ async fn save_store(dir: &Path, s: &Store) -> Result<()> {
     tokio::fs::rename(tmp, p).await?;
     Ok(())
 }
+async fn append_review_evidence_journal(
+    data_dir: &Path,
+    run_id: &RunId,
+    observation: &ObservedReviewEvidence,
+) -> Result<()> {
+    let directory = data_dir.join("review-evidence-journal");
+    tokio::fs::create_dir_all(&directory).await?;
+    let path = directory.join(format!("{}.jsonl", run_id.0));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    let mut file = options.open(&path).await?;
+    file.write_all(&serde_json::to_vec(observation)?).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    Ok(())
+}
+
+async fn remove_review_evidence_journal(data_dir: &Path, run_id: &RunId) {
+    let path = data_dir
+        .join("review-evidence-journal")
+        .join(format!("{}.jsonl", run_id.0));
+    let _ = tokio::fs::remove_file(path).await;
+}
+
 async fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(p) = path.parent() {
         tokio::fs::create_dir_all(p).await?

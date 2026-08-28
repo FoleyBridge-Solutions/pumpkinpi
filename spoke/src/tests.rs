@@ -184,6 +184,8 @@ fn observed_check(subject: &str, output: &str) -> ObservedReviewEvidence {
             .then(|| hex::encode(Sha256::digest(output.as_bytes()))),
         complete: true,
         successful: true,
+        exit_code: (!subject.ends_with(".md")).then_some(0),
+        cancelled: false,
         observed_at: now(),
     }
 }
@@ -519,11 +521,127 @@ fn spoke_issues_file_and_validation_obligations_from_reality() {
 }
 
 #[test]
+fn unchanged_complete_file_observations_are_reused_but_commands_are_not() {
+    let content = "stable\n";
+    let mut store = Store::default();
+    let mut observation = observed_check("README.md", content);
+    observation.observed_content_hash = Some(hex::encode(Sha256::digest(content.as_bytes())));
+    store
+        .review_evidence
+        .insert(RunId("prior".into()), vec![observation.clone()]);
+    let obligations = vec![
+        ReviewObligation {
+            obligation_id: "file".into(),
+            kind: ReviewObligationKind::ProjectFile,
+            subject: "README.md".into(),
+            expected_content_hash: observation.observed_content_hash.clone(),
+            validation_area: None,
+        },
+        ReviewObligation {
+            obligation_id: "command".into(),
+            kind: ReviewObligationKind::ValidationCommand,
+            subject: "cargo test".into(),
+            expected_content_hash: None,
+            validation_area: Some("tests".into()),
+        },
+    ];
+    let reused = reusable_review_file_evidence(&store, &obligations);
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0].evidence_id, observation.evidence_id);
+
+    let mut changed = obligations;
+    changed[0].expected_content_hash = Some("changed".into());
+    assert!(reusable_review_file_evidence(&store, &changed).is_empty());
+}
+
+#[tokio::test]
+async fn spoke_validation_executor_records_zero_and_nonzero_exit_status() {
+    let dir = std::env::temp_dir().join(format!("pumpkinpi-validation-test-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let obligations = vec![
+        ReviewObligation {
+            obligation_id: "passes".into(),
+            kind: ReviewObligationKind::ValidationCommand,
+            subject: "printf validated".into(),
+            expected_content_hash: None,
+            validation_area: Some("passing check".into()),
+        },
+        ReviewObligation {
+            obligation_id: "fails".into(),
+            kind: ReviewObligationKind::ValidationCommand,
+            subject: "exit 7".into(),
+            expected_content_hash: None,
+            validation_area: Some("failing check".into()),
+        },
+    ];
+    let project = ProjectRecord {
+        project_id: "project".into(),
+        spoke_id: "spoke".into(),
+        name: "validation fixture".into(),
+        cwd: dir.to_string_lossy().into_owned(),
+        source_of_intent_id: "source".into(),
+        intent_chat_id: "chat".into(),
+        initialization_status: InitializationStatus::Ready,
+        default_provider: None,
+        default_model: None,
+        run_as_user: None,
+        allow_root_sessions: false,
+        status: ProjectStatus::Active,
+        trusted: true,
+        realization_status: RealizationStatus::Reviewing,
+        created_at: now(),
+        updated_at: now(),
+    };
+    let evidence =
+        execute_validation_obligations(&project, &dir, &dir.join("target-cache"), &obligations)
+            .await;
+    assert_eq!(evidence.len(), 2);
+    assert!(evidence[0].successful);
+    assert_eq!(evidence[0].exit_code, Some(0));
+    assert!(!evidence[0].cancelled);
+    assert!(!evidence[1].successful);
+    assert_eq!(evidence[1].exit_code, Some(7));
+    let _ = tokio::fs::remove_dir_all(dir).await;
+}
+
+#[test]
+fn role_sessions_resume_deterministically_without_cross_role_memory() {
+    let operation = OperationId("operation".into());
+    let implementation = role_session_id(&operation, &SessionPurpose::Implementation, None);
+    assert_eq!(
+        implementation,
+        role_session_id(
+            &operation,
+            &SessionPurpose::Implementation,
+            Some(&RunId("later".into()))
+        )
+    );
+    assert_ne!(
+        implementation,
+        role_session_id(&operation, &SessionPurpose::Review, None)
+    );
+    assert!(Uuid::parse_str(&implementation).is_ok());
+    assert_ne!(
+        role_session_id(
+            &operation,
+            &SessionPurpose::ApprovalReview,
+            Some(&RunId("approval-1".into()))
+        ),
+        role_session_id(
+            &operation,
+            &SessionPurpose::ApprovalReview,
+            Some(&RunId("approval-2".into()))
+        )
+    );
+}
+
+#[test]
 fn review_and_observation_purposes_use_read_only_project_mounts() {
     for purpose in [
         SessionPurpose::Intent,
         SessionPurpose::Inspection,
         SessionPurpose::Review,
+        SessionPurpose::ApprovalReview,
     ] {
         assert_eq!(project_mount_option(&purpose), "--ro-bind");
     }
@@ -983,8 +1101,14 @@ print(json.dumps({"type":"agent_settled"}), flush=True)
         store.projects[&project_id].realization_status,
         RealizationStatus::Satisfied
     );
-    assert_eq!(store.reviews.len(), 1);
-    let review = store.reviews.values().next().unwrap();
+    assert_eq!(store.reviews.len(), 2);
+    assert!(
+        store
+            .sessions
+            .values()
+            .any(|session| session.purpose == SessionPurpose::ApprovalReview)
+    );
+    let review = store.reviews.values().last().unwrap();
     assert_eq!(review.verdict, ReviewVerdict::Approved);
     let recorded = &store.review_evidence[&review.run_id];
     assert_eq!(recorded.len(), fixture_obligations.len());

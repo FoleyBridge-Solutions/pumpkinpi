@@ -43,6 +43,8 @@ id_type!(RunId);
 id_type!(ReviewId);
 id_type!(EvidenceId);
 id_type!(FindingId);
+id_type!(RequirementId);
+id_type!(DivergenceId);
 id_type!(RequestId);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -117,6 +119,7 @@ pub enum SessionPurpose {
     Implementation,
     Validation,
     Review,
+    ApprovalReview,
     Recovery,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -355,6 +358,86 @@ pub struct SessionRecord {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DivergenceState {
+    Open,
+    Addressed,
+    Verified,
+    Reopened,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequirementNode {
+    pub requirement_id: RequirementId,
+    pub document_path: String,
+    pub heading: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub source_hash: String,
+    pub kind: String,
+    pub dependencies: Vec<RequirementId>,
+    pub acceptance_criteria: Vec<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequirementIndex {
+    pub source_of_intent_revision: u64,
+    pub source_content_hash: String,
+    pub nodes: Vec<RequirementNode>,
+    pub generated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergenceRecord {
+    pub divergence_id: DivergenceId,
+    pub fingerprint: String,
+    pub project_id: ProjectId,
+    pub source_of_intent_revision: u64,
+    pub requirement_ids: Vec<RequirementId>,
+    pub requirement: String,
+    pub fault: String,
+    pub state: DivergenceState,
+    pub affected_components: Vec<String>,
+    pub evidence: Vec<String>,
+    pub verification_criteria: Vec<String>,
+    pub suggested_next_objective: Option<String>,
+    pub first_observed_reality: String,
+    pub last_observed_reality: String,
+    pub attempt_count: u64,
+    pub reopen_count: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DivergenceTransitionSummary {
+    pub opened: u64,
+    pub still_open: u64,
+    pub verified: u64,
+    pub reopened: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationTelemetry {
+    pub project_id: ProjectId,
+    pub operation_id: OperationId,
+    pub source_of_intent_revision: u64,
+    pub iteration: u64,
+    pub implementation_ms: u64,
+    pub validation_ms: u64,
+    pub review_ms: u64,
+    pub checkpoint_ms: u64,
+    pub total_ms: u64,
+    pub implementation_prompt_bytes: u64,
+    pub review_prompt_bytes: u64,
+    pub changed: bool,
+    pub divergence_transitions: DivergenceTransitionSummary,
+    pub recorded_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewFinding {
     pub finding_id: FindingId,
@@ -406,6 +489,12 @@ pub struct ProjectSnapshot {
     pub operations: Vec<OperationRecord>,
     #[serde(default)]
     pub reviews: Vec<ReviewRecord>,
+    #[serde(default)]
+    pub divergences: Vec<DivergenceRecord>,
+    #[serde(default)]
+    pub requirement_index: Option<RequirementIndex>,
+    #[serde(default)]
+    pub iteration_telemetry: Vec<IterationTelemetry>,
     pub gap_before: Option<u64>,
 }
 
@@ -747,6 +836,8 @@ pub struct ReviewRunResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewFindingProposal {
+    #[serde(default)]
+    pub requirement_ids: Vec<RequirementId>,
     pub requirement: String,
     pub fault: String,
     pub evidence: Vec<String>,
