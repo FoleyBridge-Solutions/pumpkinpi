@@ -1660,17 +1660,50 @@ async fn run_pi(
     mut cancel: watch::Receiver<bool>,
     provider_env: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let mut cmd = Command::new(
-        state
-            .config
-            .pi_binary
-            .as_deref()
-            .unwrap_or_else(|| Path::new("pi")),
-    );
-    cmd.arg("--mode")
+    let pi_binary = state
+        .config
+        .pi_binary
+        .as_deref()
+        .unwrap_or_else(|| Path::new("pi"));
+    let isolated = state.store.lock().await.workspaces.get(operation).cloned();
+    let mut cmd = Command::new("bwrap");
+    cmd.args([
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        "/tmp",
+        "/tmp",
+    ]);
+    let sandbox_cwd = if let Some(workspace) = &isolated {
+        let writable = matches!(
+            purpose,
+            SessionPurpose::Implementation
+                | SessionPurpose::Validation
+                | SessionPurpose::Review
+                | SessionPurpose::Recovery
+        );
+        cmd.arg(if writable { "--bind" } else { "--ro-bind" })
+            .arg(&workspace.worktree_root)
+            .arg(&workspace.primary_root);
+        workspace.primary_cwd.clone()
+    } else {
+        PathBuf::from(&project.cwd)
+    };
+    cmd.arg("--chdir")
+        .arg(&sandbox_cwd)
+        .arg("--")
+        .arg(pi_binary)
+        .arg("--mode")
         .arg("rpc")
         .arg("--no-session")
-        .current_dir(&project.cwd)
+        .current_dir("/")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
