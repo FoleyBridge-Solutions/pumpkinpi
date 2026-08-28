@@ -1546,6 +1546,48 @@ async fn persist_review(
     Ok(record)
 }
 
+async fn isolated_pi_agent_dir(data_dir: &Path, operation: &OperationId) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is required")?;
+    let source = home.join(".pi/agent");
+    let destination = data_dir.join("sandboxes").join(&operation.0).join("agent");
+    if destination.exists() {
+        return Ok(destination);
+    }
+    let source_for_copy = source.clone();
+    let destination_for_copy = destination.clone();
+    tokio::task::spawn_blocking(move || {
+        fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(destination)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                if entry.file_name() == "sessions" {
+                    continue;
+                }
+                let from = entry.path();
+                let to = destination.join(entry.file_name());
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    copy_tree(&from, &to)?;
+                } else if file_type.is_symlink() {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+                } else if file_type.is_file() {
+                    std::fs::copy(&from, &to)?;
+                    std::fs::set_permissions(&to, entry.metadata()?.permissions())?;
+                }
+            }
+            Ok(())
+        }
+        copy_tree(&source_for_copy, &destination_for_copy)
+    })
+    .await
+    .context("Pi credential sandbox copy task failed")?
+    .context("failed to create isolated Pi credential sandbox")?;
+    Ok(destination)
+}
+
 async fn project_fingerprint(root: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         fn visit(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -1668,6 +1710,11 @@ async fn run_pi(
             .unwrap_or_else(|| PathBuf::from("pi"))
     });
     let isolated = state.store.lock().await.workspaces.get(operation).cloned();
+    let isolated_agent = if state.config.pi_binary.is_none() {
+        Some(isolated_pi_agent_dir(&state.data_dir, operation).await?)
+    } else {
+        None
+    };
     let mut cmd = Command::new("bwrap");
     cmd.args([
         "--die-with-parent",
@@ -1683,6 +1730,12 @@ async fn run_pi(
         "/tmp",
         "/tmp",
     ]);
+    if let Some(agent) = &isolated_agent {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is required")?;
+        cmd.arg("--bind").arg(agent).arg(home.join(".pi/agent"));
+    }
     let sandbox_cwd = if let Some(workspace) = &isolated {
         let writable = matches!(
             purpose,
@@ -1757,6 +1810,17 @@ async fn run_pi(
                 let Some(line) = line? else { break };
                 let v: serde_json::Value = match serde_json::from_str(line.trim_end_matches('\r')) { Ok(v) => v, Err(_) => continue };
                 let event_type = v.get("type").and_then(|x| x.as_str()).unwrap_or_default();
+                if event_type == "response"
+                    && v.get("id").and_then(|value| value.as_str()) == Some("prompt")
+                    && v.get("success").and_then(|value| value.as_bool()) == Some(false)
+                {
+                    let error = v
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Pi rejected the prompt");
+                    let _ = child.kill().await;
+                    return Err(anyhow!("Pi prompt failed: {error}"));
+                }
                 if event_type == "extension_ui_request" {
                     let request_id = v.get("id").and_then(|x| x.as_str()).context("extension UI request missing id")?.to_string();
                     let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("notify").to_string();
