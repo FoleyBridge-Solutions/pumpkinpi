@@ -96,6 +96,12 @@ struct ObservedReviewEvidence {
     subject: String,
     args: serde_json::Value,
     output_lines: Vec<String>,
+    /// SHA-256 of the exact text returned by a read tool event. This binds a claimed file
+    /// observation to bytes received during the review rather than to copied coverage prose.
+    #[serde(default)]
+    observed_content_hash: Option<String>,
+    #[serde(default)]
+    complete: bool,
     successful: bool,
     observed_at: u64,
 }
@@ -1580,6 +1586,11 @@ fn corroborate_approval(
         ));
     }
 
+    let coverage = result
+        .source_coverage
+        .iter()
+        .map(|item| (item.path.as_str(), item.content_hash.as_str()))
+        .collect::<BTreeMap<_, _>>();
     let mut used_evidence = BTreeSet::new();
     for obligation in obligations {
         let evidence_id = &reported[&obligation.obligation_id];
@@ -1613,10 +1624,29 @@ fn corroborate_approval(
                         .and_then(|value| value.as_u64())
                         .unwrap_or(1)
                         == 1
-                    && item.args.get("limit").is_none();
+                    && item.args.get("limit").is_none()
+                    && item.complete;
                 if !full_read {
                     return Err(anyhow!(
-                        "file review obligation requires a successful unbounded read from line 1: {}",
+                        "file review obligation requires a successful complete unbounded read from line 1: {}",
+                        obligation.subject
+                    ));
+                }
+                let expected_hash =
+                    obligation.expected_content_hash.as_deref().ok_or_else(|| {
+                        anyhow!("file review obligation is missing its Spoke-issued content hash")
+                    })?;
+                if item.observed_content_hash.as_deref() != Some(expected_hash) {
+                    return Err(anyhow!(
+                        "file review observation bytes do not match the Spoke-issued content hash: {}",
+                        obligation.subject
+                    ));
+                }
+                if obligation.kind == ReviewObligationKind::AuthoritativeDocument
+                    && coverage.get(obligation.subject.as_str()).copied() != Some(expected_hash)
+                {
+                    return Err(anyhow!(
+                        "authoritative document coverage is not bound to its observed read: {}",
                         obligation.subject
                     ));
                 }
@@ -2186,20 +2216,25 @@ fn observed_review_evidence(
         .get("result")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let mut output_lines = Vec::new();
-    if let Some(content) = result.get("content").and_then(|value| value.as_array()) {
-        for text in content
-            .iter()
-            .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
-        {
-            output_lines.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string),
-            );
-        }
-    }
+    let returned_text = result
+        .get("content")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+        .collect::<String>();
+    let output_lines = returned_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let complete = result
+        .get("details")
+        .and_then(|details| details.get("truncation"))
+        .is_none_or(serde_json::Value::is_null);
+    let observed_content_hash = (tool_name == "read" && complete)
+        .then(|| hex::encode(Sha256::digest(returned_text.as_bytes())));
     let canonical = json!({
         "toolCallId": tool_call_id,
         "toolName": tool_name,
@@ -2218,6 +2253,8 @@ fn observed_review_evidence(
         subject,
         args,
         output_lines,
+        observed_content_hash,
+        complete,
         successful: !event
             .get("isError")
             .and_then(|value| value.as_bool())

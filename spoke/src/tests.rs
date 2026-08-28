@@ -179,6 +179,10 @@ fn observed_check(subject: &str, output: &str) -> ObservedReviewEvidence {
             json!({"command": subject})
         },
         output_lines: vec![output.into()],
+        observed_content_hash: subject
+            .ends_with(".md")
+            .then(|| hex::encode(Sha256::digest(output.as_bytes()))),
+        complete: true,
         successful: true,
         observed_at: now(),
     }
@@ -326,8 +330,8 @@ fn copied_coverage_and_one_trivial_read_cannot_approve_complete_scope() {
         bundle_hash: "bundle".into(),
         documents: vec![SourceDocument {
             path: "design.md".into(),
-            content_hash: "canonical-hash".into(),
-            byte_len: 7,
+            content_hash: hex::encode(Sha256::digest(b"# Intent")),
+            byte_len: 8,
             content: "# Intent".into(),
         }],
     };
@@ -336,7 +340,7 @@ fn copied_coverage_and_one_trivial_read_cannot_approve_complete_scope() {
             obligation_id: "read-design".into(),
             kind: ReviewObligationKind::AuthoritativeDocument,
             subject: "design.md".into(),
-            expected_content_hash: Some("canonical-hash".into()),
+            expected_content_hash: Some(hex::encode(Sha256::digest(b"# Intent"))),
             validation_area: None,
         },
         ReviewObligation {
@@ -388,6 +392,93 @@ fn copied_coverage_and_one_trivial_read_cannot_approve_complete_scope() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("not bound to a successful Spoke-observed tool result"));
+}
+
+#[test]
+fn copied_coverage_and_trivial_read_output_cannot_approve() {
+    let content = "# Canonical intent\n";
+    let content_hash = hex::encode(Sha256::digest(content.as_bytes()));
+    let bundle = SourceOfIntentBundle {
+        manifest_path: "design.md".into(),
+        bundle_hash: "bundle".into(),
+        documents: vec![SourceDocument {
+            path: "design.md".into(),
+            content_hash: content_hash.clone(),
+            byte_len: content.len() as u64,
+            content: content.into(),
+        }],
+    };
+    let obligation = ReviewObligation {
+        obligation_id: "read-design".into(),
+        kind: ReviewObligationKind::AuthoritativeDocument,
+        subject: "design.md".into(),
+        expected_content_hash: Some(content_hash),
+        validation_area: None,
+    };
+    let observation = observed_check("design.md", "fixture-observed");
+    let review = ReviewRunResult {
+        source_coverage: source_bundle::coverage(&bundle),
+        target_revision: 3,
+        observed_reality_version: "reality".into(),
+        scope: ReviewScope::WholeProject,
+        reviewed_scope: vec![obligation.obligation_id.clone()],
+        checks: vec![obligation.subject.clone()],
+        evidence: vec![observation.evidence_id.clone()],
+        obligation_observations: vec![ReviewObligationObservation {
+            obligation_id: obligation.obligation_id.clone(),
+            evidence_id: observation.evidence_id.clone(),
+        }],
+        findings: vec![],
+        unreviewed_required_scope: vec![],
+        verdict: ReviewVerdict::Approved,
+    };
+
+    let error = validate_review_for_promotion(
+        &review,
+        3,
+        "reality",
+        Some(&bundle),
+        &[obligation],
+        &[observation],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("observation bytes do not match"));
+}
+
+#[test]
+fn truncated_file_read_cannot_satisfy_an_obligation() {
+    let content_hash = hex::encode(Sha256::digest(b"complete"));
+    let obligation = ReviewObligation {
+        obligation_id: "read-project-file".into(),
+        kind: ReviewObligationKind::ProjectFile,
+        subject: "README.md".into(),
+        expected_content_hash: Some(content_hash),
+        validation_area: None,
+    };
+    let mut observation = observed_check("README.md", "complete");
+    observation.complete = false;
+    let review = ReviewRunResult {
+        source_coverage: vec![],
+        target_revision: 1,
+        observed_reality_version: "reality".into(),
+        scope: ReviewScope::WholeProject,
+        reviewed_scope: vec![obligation.obligation_id.clone()],
+        checks: vec![obligation.subject.clone()],
+        evidence: vec![observation.evidence_id.clone()],
+        obligation_observations: vec![ReviewObligationObservation {
+            obligation_id: obligation.obligation_id.clone(),
+            evidence_id: observation.evidence_id.clone(),
+        }],
+        findings: vec![],
+        unreviewed_required_scope: vec![],
+        verdict: ReviewVerdict::Approved,
+    };
+
+    assert!(
+        validate_review_for_promotion(&review, 1, "reality", None, &[obligation], &[observation],)
+            .is_err()
+    );
 }
 
 #[test]
