@@ -541,6 +541,7 @@ pub enum ClientPayload {
         request_id: String,
         method: String,
         payload: Value,
+        created_at: u64,
     },
     ProjectUpdated {
         project: ProjectRecord,

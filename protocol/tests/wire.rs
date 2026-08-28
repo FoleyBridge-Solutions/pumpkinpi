@@ -54,6 +54,27 @@ fn reviewer_cannot_approve_with_findings_or_unreviewed_scope() {
 }
 
 #[test]
+fn interaction_events_carry_their_creation_timestamp() {
+    let event = ClientEvent {
+        protocol_version: PROTOCOL_VERSION,
+        id: None,
+        payload: ClientPayload::Interaction {
+            spoke_id: SpokeId("spoke-1".into()),
+            project_id: ProjectId("project-1".into()),
+            operation_id: OperationId("operation-1".into()),
+            request_id: "interaction-1".into(),
+            method: "confirm".into(),
+            payload: serde_json::json!({"message": "Proceed?"}),
+            created_at: 1_704_164_645,
+        },
+    };
+
+    let value = serde_json::to_value(event).unwrap();
+    assert_eq!(value["type"], "interaction");
+    assert_eq!(value["created_at"], 1_704_164_645_u64);
+}
+
+#[test]
 fn public_event_does_not_require_raw_json() {
     let event = ClientEvent {
         protocol_version: PROTOCOL_VERSION,

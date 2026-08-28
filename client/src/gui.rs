@@ -92,6 +92,7 @@ struct InteractionView {
     request_id: String,
     method: String,
     payload: Value,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -492,6 +493,7 @@ impl GuiRuntime {
                 request_id,
                 method,
                 payload,
+                created_at,
             } => {
                 let interaction = InteractionView {
                     spoke_id,
@@ -500,6 +502,7 @@ impl GuiRuntime {
                     request_id: request_id.clone(),
                     method,
                     payload,
+                    created_at,
                 };
                 store
                     .interactions
@@ -1231,7 +1234,7 @@ where
         .to_string()
 }
 
-fn format_local_timestamp(timestamp: u64) -> String {
+pub(crate) fn format_local_timestamp(timestamp: u64) -> String {
     format_timestamp(timestamp, &Local)
 }
 
@@ -1295,10 +1298,14 @@ fn render_interaction(
     let deny_interaction = interaction.clone();
     let answer_runtime = runtime.clone();
     let answer_interaction = interaction.clone();
+    let timestamp = format_local_timestamp(interaction.created_at);
 
     rsx! {
         article { class: "interaction-card", key: "{interaction.operation_id}-{interaction.request_id}",
-            h3 { "Action required · {interaction.method}" }
+            div { class: "interaction-meta",
+                h3 { "Action required · {interaction.method}" }
+                time { datetime: "{timestamp}", "{timestamp}" }
+            }
             p { "{prompt}" }
             div { class: "interaction-actions",
                 input { placeholder: "Type a response…", value: "{answer}", oninput: move |event| answer.set(event.value()) }

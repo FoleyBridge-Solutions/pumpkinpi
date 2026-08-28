@@ -363,15 +363,63 @@ async fn read_event<
 }
 fn print_event(e: &ClientEvent) {
     match &e.payload {
-        ClientPayload::Timeline { item } => println!(
-            "\n{}",
-            item.content
-                .as_deref()
-                .or(item.summary.as_deref())
-                .unwrap_or("")
+        ClientPayload::ProjectSnapshot { snapshot } => {
+            for item in &snapshot.timeline {
+                print_timeline_item(item);
+            }
+        }
+        ClientPayload::Timeline { item } => print_timeline_item(item),
+        ClientPayload::Accepted { operation } | ClientPayload::Operation { operation } => println!(
+            "[{}] [operation {:?}]",
+            gui::format_local_timestamp(operation.updated_at),
+            operation.status
         ),
-        ClientPayload::Operation { operation } => println!("[operation {:?}]", operation.status),
-        ClientPayload::Error { message, .. } => eprintln!("error: {message}"),
-        _ => println!("{}", serde_json::to_string_pretty(e).unwrap()),
+        ClientPayload::Interaction {
+            method,
+            payload,
+            created_at,
+            ..
+        } => {
+            let prompt = payload
+                .get("message")
+                .or_else(|| payload.get("prompt"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| payload.to_string());
+            println!(
+                "\n[{}] [Action required · {method}] {prompt}",
+                gui::format_local_timestamp(*created_at)
+            );
+        }
+        ClientPayload::Error { message, .. } => eprintln!(
+            "[{}] error: {message}",
+            gui::format_local_timestamp(
+                chrono::Utc::now()
+                    .timestamp()
+                    .try_into()
+                    .unwrap_or_default()
+            )
+        ),
+        _ => println!(
+            "[{}] {}",
+            gui::format_local_timestamp(
+                chrono::Utc::now()
+                    .timestamp()
+                    .try_into()
+                    .unwrap_or_default()
+            ),
+            serde_json::to_string_pretty(e).unwrap()
+        ),
     }
+}
+
+fn print_timeline_item(item: &TimelineItem) {
+    println!(
+        "\n[{}] {}",
+        gui::format_local_timestamp(item.created_at),
+        item.content
+            .as_deref()
+            .or(item.summary.as_deref())
+            .unwrap_or("")
+    );
 }
