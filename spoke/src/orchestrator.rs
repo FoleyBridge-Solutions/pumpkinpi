@@ -1,3 +1,4 @@
+use crate::ObservedReviewEvidence;
 use anyhow::{Result, anyhow};
 use pumpkinpi_protocol::{
     ImplementationRunResult, IntentTurnProposal, ReviewFindingProposal, ReviewObligation,
@@ -177,7 +178,9 @@ Find every fault you can: omissions, incorrect behavior, architecture violations
 
 Read and hash every document in the authoritative bundle before review. Return exact path/hash pairs in source_coverage. Missing or changed coverage prohibits approval.
 
-Return ONLY one JSON object with this schema:
+This is the evidence-capture phase. Perform all inspection and validation tool work, then end your turn without a final assessment. The Spoke will durably record the observed tool results and send their generated evidence IDs back in a second, Spoke-controlled assessment prompt. Only that second turn may return the final JSON below. Never guess or precompute evidence IDs.
+
+On the second turn, return ONLY one JSON object with this schema:
 {{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"obligation_observations":[{{"obligation_id":string,"evidence_id":string}}],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
 
 The Spoke issued the obligations below before this Run. For approval, perform every exact required read or command. A file obligation requires an unbounded read from line 1. Put every obligation_id exactly once in reviewed_scope; put every exact obligation subject in checks; put every captured durable sha256 evidence ID in evidence; and map each obligation to its own successful event in obligation_observations. One event cannot satisfy multiple obligations. Output text, copied coverage, arbitrary scope prose, partial reads, and unissued checks cannot establish approval. Findings may continue to cite descriptive evidence.
@@ -195,6 +198,18 @@ AUTHORITATIVE DOCUMENT BUNDLE:
 
 IMPLEMENTATION RUN CLAIMS (claims are not evidence):
 {implementation}"#
+    )
+}
+
+pub(crate) fn review_assessment_prompt(observations: &[ObservedReviewEvidence]) -> String {
+    let observations = serde_json::to_string_pretty(observations).unwrap_or_else(|_| "[]".into());
+    format!(
+        r#"The Spoke has durably recorded the tool observations from your evidence-capture turn. Their generated IDs and independently captured metadata are below.
+
+Now make the final assessment. Return ONLY the typed review JSON requested in the original review instructions. Bind obligations only to applicable successful observations from this manifest. Copy evidence_id values exactly; never invent, derive, or substitute an ID. Approval is prohibited unless this manifest independently and completely supports every issued obligation. Findings remain required for every fault, and any incomplete scope must be reported.
+
+SPOKE-RECORDED OBSERVATION MANIFEST:
+{observations}"#
     )
 }
 

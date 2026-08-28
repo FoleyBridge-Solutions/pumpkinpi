@@ -1985,6 +1985,7 @@ async fn run_internal(
         state,
         tx,
         operation,
+        &run_id,
         project,
         purpose,
         prompt,
@@ -2011,6 +2012,7 @@ async fn run_pi(
     state: &State,
     tx: &Tx,
     operation: &OperationId,
+    run_id: &RunId,
     project: &ProjectRecord,
     purpose: SessionPurpose,
     prompt: &str,
@@ -2117,6 +2119,7 @@ async fn run_pi(
     let mut lines = BufReader::new(stdout).lines();
     let mut final_text = String::new();
     let mut observations = Vec::new();
+    let mut assessment_requested = false;
     let mut pending_tools: HashMap<String, (String, serde_json::Value)> = HashMap::new();
     loop {
         tokio::select! {
@@ -2128,7 +2131,10 @@ async fn run_pi(
                 let v: serde_json::Value = match serde_json::from_str(line.trim_end_matches('\r')) { Ok(v) => v, Err(_) => continue };
                 let event_type = v.get("type").and_then(|x| x.as_str()).unwrap_or_default();
                 if event_type == "response"
-                    && v.get("id").and_then(|value| value.as_str()) == Some("prompt")
+                    && matches!(
+                        v.get("id").and_then(|value| value.as_str()),
+                        Some("prompt" | "review-assessment")
+                    )
                     && v.get("success").and_then(|value| value.as_bool()) == Some(false)
                 {
                     let error = v
@@ -2177,9 +2183,30 @@ async fn run_pi(
                     && let Some(observation) = observed_review_evidence(&v, tool_name, args)
                 {
                     observations.push(observation);
+                    if purpose == SessionPurpose::Review {
+                        let mut store = state.store.lock().await;
+                        store.review_evidence.insert(run_id.clone(), observations.clone());
+                        save_store(&state.data_dir, &store).await?;
+                    }
                 }
                 if event_type == "message_end" && let Some(t) = message_content(&v) { final_text = t }
-                if event_type == "agent_settled" { break }
+                if event_type == "agent_settled" {
+                    if purpose == SessionPurpose::Review && !assessment_requested {
+                        let assessment_prompt = orchestrator::review_assessment_prompt(&observations);
+                        stdin.write_all(
+                            format!(
+                                "{}\n",
+                                json!({"id":"review-assessment","type":"prompt","message":assessment_prompt})
+                            )
+                            .as_bytes(),
+                        ).await?;
+                        stdin.flush().await?;
+                        final_text.clear();
+                        assessment_requested = true;
+                        continue;
+                    }
+                    break
+                }
             }
         }
     }

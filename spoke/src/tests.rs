@@ -565,7 +565,6 @@ async fn active_intent_iterates_through_independent_review_to_satisfaction() {
     )
     .unwrap();
     let mut fixture_events = Vec::new();
-    let mut fixture_bindings = Vec::new();
     for (index, obligation) in fixture_obligations.iter().enumerate() {
         let tool_call_id = format!("fixture-call-{index}");
         let (tool_name, args, text) = match obligation.kind {
@@ -586,25 +585,15 @@ async fn active_intent_iterates_through_independent_review_to_satisfaction() {
             "toolName": tool_name,
             "args": args,
         }));
-        let end = json!({
+        fixture_events.push(json!({
             "type": "tool_execution_end",
             "toolCallId": tool_call_id,
             "toolName": tool_name,
             "result": {"content": [{"type": "text", "text": text}]},
             "isError": false,
-        });
-        let observation = observed_review_evidence(&end, tool_name.into(), args).unwrap();
-        fixture_bindings.push(ReviewObligationObservation {
-            obligation_id: obligation.obligation_id.clone(),
-            evidence_id: observation.evidence_id,
-        });
-        fixture_events.push(end);
+        }));
     }
-    let fixture_event_lines = fixture_events
-        .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let fixture_events = serde_json::to_string(&fixture_events).unwrap();
     let fixture_scope = serde_json::to_string(
         &fixture_obligations
             .iter()
@@ -619,42 +608,43 @@ async fn active_intent_iterates_through_independent_review_to_satisfaction() {
             .collect::<Vec<_>>(),
     )
     .unwrap();
-    let fixture_evidence = serde_json::to_string(
-        &fixture_bindings
-            .iter()
-            .map(|item| &item.evidence_id)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let fixture_bindings = serde_json::to_string(&fixture_bindings).unwrap();
-
     let fake_pi = dir.join("fake-pi");
-    let script = r####"#!/bin/sh
-read request
-case "$request" in
-  *"Project Intent Agent"*)
-    result='{"acts":["reference_context"],"source_coverage":__COVERAGE__,"projection":"Intent adopted.","question":null,"source_update":{"base_revision":0,"canonical_payload":"# Intent\\n\\nImplement and validate the fixture completely.","activate":true},"assumptions":[]}'
-    ;;
-  *"independent whole-Project reviewer"*)
-    reality=$(printf '%s' "$request" | sed -n 's/.*observed_reality_version [^0-9a-f]*\([0-9a-f]\{64\}\).*/\1/p')
-    printf '%s\n' '__REVIEW_EVENTS__'
-    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":__REVIEW_SCOPE__,"checks":__REVIEW_CHECKS__,"evidence":__REVIEW_EVIDENCE__,"obligation_observations":__REVIEW_BINDINGS__,"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
-    ;;
-  *)
-    result='{"source_coverage":__COVERAGE__,"objective":"verify fixture","summary":"Fixture conforms.","observations":["README exists"],"changes":[],"validation":["fixture inspected"],"evidence":["README.md"],"residual_divergence":[],"question":null}'
-    ;;
-esac
-escaped=$(printf '%s' "$result" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s\n' "{\"type\":\"message_end\",\"message\":{\"content\":\"$escaped\"}}"
-printf '%s\n' '{"type":"agent_settled"}'
+    let script = r####"#!/usr/bin/env python3
+import json
+import re
+import sys
+
+coverage = json.loads(r'''__COVERAGE__''')
+review_events = json.loads(r'''__REVIEW_EVENTS__''')
+review_scope = json.loads(r'''__REVIEW_SCOPE__''')
+review_checks = json.loads(r'''__REVIEW_CHECKS__''')
+request = json.loads(sys.stdin.readline())
+message = request["message"]
+if "Project Intent Agent" in message:
+    result = {"acts":["reference_context"],"source_coverage":coverage,"projection":"Intent adopted.","question":None,"source_update":{"base_revision":0,"canonical_payload":"# Intent\n\nImplement and validate the fixture completely.","activate":True},"assumptions":[]}
+elif "independent whole-Project reviewer" in message:
+    reality = re.search(r'observed_reality_version [^0-9a-f]*([0-9a-f]{64})', message).group(1)
+    for event in review_events:
+        print(json.dumps(event), flush=True)
+    print(json.dumps({"type":"message_end","message":{"content":"evidence capture complete"}}), flush=True)
+    print(json.dumps({"type":"agent_settled"}), flush=True)
+    assessment = json.loads(sys.stdin.readline())
+    assert assessment["id"] == "review-assessment"
+    manifest = json.loads(assessment["message"].split("SPOKE-RECORDED OBSERVATION MANIFEST:\n", 1)[1])
+    evidence = [item["evidence_id"] for item in manifest]
+    assert all(item.startswith("sha256:") for item in evidence)
+    bindings = [{"obligation_id": obligation, "evidence_id": evidence[index]} for index, obligation in enumerate(review_scope)]
+    result = {"source_coverage":coverage,"target_revision":1,"observed_reality_version":reality,"scope":"whole_project","reviewed_scope":review_scope,"checks":review_checks,"evidence":evidence,"obligation_observations":bindings,"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}
+else:
+    result = {"source_coverage":coverage,"objective":"verify fixture","summary":"Fixture conforms.","observations":["README exists"],"changes":[],"validation":["fixture inspected"],"evidence":["README.md"],"residual_divergence":[],"question":None}
+print(json.dumps({"type":"message_end","message":{"content":json.dumps(result)}}), flush=True)
+print(json.dumps({"type":"agent_settled"}), flush=True)
 "####;
     let script = script
         .replace("__COVERAGE__", &coverage_json)
-        .replace("__REVIEW_EVENTS__", &fixture_event_lines)
+        .replace("__REVIEW_EVENTS__", &fixture_events)
         .replace("__REVIEW_SCOPE__", &fixture_scope)
-        .replace("__REVIEW_CHECKS__", &fixture_checks)
-        .replace("__REVIEW_EVIDENCE__", &fixture_evidence)
-        .replace("__REVIEW_BINDINGS__", &fixture_bindings);
+        .replace("__REVIEW_CHECKS__", &fixture_checks);
     tokio::fs::write(&fake_pi, script).await.unwrap();
     #[cfg(unix)]
     {
@@ -779,9 +769,20 @@ printf '%s\n' '{"type":"agent_settled"}'
         RealizationStatus::Satisfied
     );
     assert_eq!(store.reviews.len(), 1);
+    let review = store.reviews.values().next().unwrap();
+    assert_eq!(review.verdict, ReviewVerdict::Approved);
+    let recorded = &store.review_evidence[&review.run_id];
+    assert_eq!(recorded.len(), fixture_obligations.len());
     assert_eq!(
-        store.reviews.values().next().unwrap().verdict,
-        ReviewVerdict::Approved
+        review
+            .obligation_observations
+            .iter()
+            .map(|binding| &binding.evidence_id)
+            .collect::<Vec<_>>(),
+        recorded
+            .iter()
+            .map(|observation| &observation.evidence_id)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         store.operations[&operation_id].status,
