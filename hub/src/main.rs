@@ -1,65 +1,104 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{
-        Path as AxumPath, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
-    http::HeaderMap,
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use clap::Parser;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use pumpkinpi_protocol::PROTOCOL_VERSION;
+use futures_util::{SinkExt, StreamExt};
+use pumpkinpi_protocol::*;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-mod cli;
-mod node;
-mod provider;
-mod state;
-mod user;
+#[cfg(test)]
+mod tests;
 
-use cli::{
-    Cli, HubSubcommand, NodeCommand, NodeSubcommand, ProviderCommand, ProviderSubcommand,
-    ServeArgs, UserCommand, UserSubcommand,
-};
-use node::{
-    ChallengeMessage, CreateNodeHttp, EnrollRequest, EnrollResponse, NodeRecord, NodeStatus,
-};
-use provider::{EncryptedSecret, ProviderAccountRecord};
-use state::{AppState, PendingRequest, SessionKey};
-use user::{NodeAccessGrant, UserRecord};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SETUP_KEY_TTL_SECS: u64 = 30 * 60;
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct HubStore {
+#[derive(Parser)]
+#[command(name = "pumpkinpi-hub", version)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+    #[arg(long, env = "PUMPKINPI_HUB_DATA")]
+    data_dir: Option<PathBuf>,
+}
+#[derive(Subcommand)]
+enum Cmd {
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        public_url: String,
+    },
+    OwnerToken,
+    Spoke {
+        #[command(subcommand)]
+        command: SpokeCommand,
+    },
+    Reset {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Subcommand)]
+enum SpokeCommand {
+    Create { name: String },
+    List,
+    Disable { spoke_id: String },
+    Revoke { spoke_id: String },
+    IssueSetupKey { spoke_id: String },
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct SpokeAuth {
+    record: SpokeRecord,
+    public_key: Option<String>,
+    setup_key_hash: Option<String>,
+    setup_expires_at: Option<u64>,
+    projects: BTreeMap<ProjectId, ProjectRecord>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Store {
+    owner_token_hash: Option<String>,
+    spokes: BTreeMap<SpokeId, SpokeAuth>,
     #[serde(default)]
-    nodes: HashMap<String, NodeRecord>,
+    snapshots: Vec<ProjectSnapshot>,
     #[serde(default)]
-    users: HashMap<String, UserRecord>,
-    #[serde(default)]
-    node_access_grants: Vec<NodeAccessGrant>,
-    #[serde(default)]
-    provider_accounts: HashMap<String, ProviderAccountRecord>,
+    providers: Vec<StoredProvider>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredProvider {
+    account: ProviderAccount,
+    nonce: String,
+    ciphertext: String,
+}
+#[derive(Clone)]
+struct App {
+    store: Arc<Mutex<Store>>,
+    spokes: Arc<Mutex<HashMap<SpokeId, mpsc::UnboundedSender<Message>>>>,
+    clients: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>,
+    subs: Arc<Mutex<HashMap<String, BTreeSet<ProjectKey>>>>,
+    pending: Arc<Mutex<HashMap<(SpokeId, RequestId), String>>>,
+    data: PathBuf,
+    public_url: String,
+    master_key: [u8; 32],
 }
 
 #[tokio::main]
@@ -67,1608 +106,952 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-
     let cli = Cli::parse();
-    match cli.command {
-        HubSubcommand::Serve(args) => serve_hub(args).await,
-        HubSubcommand::Node(node) => hub_node_cli(node).await,
-        HubSubcommand::User(user) => hub_user_cli(user).await,
-        HubSubcommand::Provider(provider) => hub_provider_cli(provider).await,
+    let dir = cli.data_dir.unwrap_or_else(default_dir);
+    match cli.cmd {
+        Cmd::Serve { listen, public_url } => serve(dir, listen, public_url).await,
+        Cmd::OwnerToken => owner_token(&dir).await,
+        Cmd::Spoke { command } => spoke_cli(&dir, command).await,
+        Cmd::Reset { yes } => {
+            if !yes {
+                return Err(anyhow!("reset destroys prerelease state; pass --yes"));
+            }
+            if dir.exists() {
+                tokio::fs::remove_dir_all(dir).await?
+            }
+            Ok(())
+        }
     }
 }
-
-async fn serve_hub(args: ServeArgs) -> Result<()> {
-    let data_dir = args.data_dir.unwrap_or_else(default_hub_data_dir);
-    let store = HubStore::load(&data_dir).await?;
-    let state = AppState {
-        store: Arc::new(Mutex::new(store)),
-        node_channels: Arc::new(Mutex::new(HashMap::new())),
-        client_channels: Arc::new(Mutex::new(HashMap::new())),
-        client_users: Arc::new(Mutex::new(HashMap::new())),
-        in_flight: Arc::new(Mutex::new(HashMap::new())),
-        subscriptions: Arc::new(Mutex::new(HashMap::new())),
-        recent_events: Arc::new(Mutex::new(HashMap::new())),
-        data_dir,
-        public_url: args.public_url,
-        admin_token: args.admin_token,
+fn default_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into())
+        .join(".local/state/pumpkinpi-hub-v3")
+}
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+fn secret(prefix: &str) -> String {
+    let mut b = [0u8; 32];
+    OsRng.fill_bytes(&mut b);
+    format!("{prefix}_{}", BASE64.encode(b).replace(['+', '/', '='], ""))
+}
+fn hash(v: &str) -> String {
+    hex::encode(Sha256::digest(v.as_bytes()))
+}
+async fn owner_token(dir: &Path) -> Result<()> {
+    let mut s = load(dir).await?;
+    let token = secret("ppc");
+    s.owner_token_hash = Some(hash(&token));
+    save(dir, &s).await?;
+    println!("{token}");
+    Ok(())
+}
+async fn spoke_cli(dir: &Path, command: SpokeCommand) -> Result<()> {
+    let mut store = load(dir).await?;
+    match command {
+        SpokeCommand::Create { name } => {
+            let (id, key) = create_spoke(&mut store, name);
+            println!("spoke_id: {id}\nsetup_key: {key}");
+        }
+        SpokeCommand::List => println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &store.spokes.values().map(|s| &s.record).collect::<Vec<_>>()
+            )?
+        ),
+        SpokeCommand::Disable { spoke_id } => {
+            store
+                .spokes
+                .get_mut(&SpokeId(spoke_id))
+                .context("spoke not found")?
+                .record
+                .status = SpokeStatus::Disabled;
+        }
+        SpokeCommand::Revoke { spoke_id } => {
+            store
+                .spokes
+                .get_mut(&SpokeId(spoke_id))
+                .context("spoke not found")?
+                .record
+                .status = SpokeStatus::Revoked;
+        }
+        SpokeCommand::IssueSetupKey { spoke_id } => {
+            let spoke = store
+                .spokes
+                .get_mut(&SpokeId(spoke_id))
+                .context("spoke not found")?;
+            let key = secret("pps_setup");
+            spoke.setup_key_hash = Some(hash(&key));
+            spoke.setup_expires_at = Some(now() + 1800);
+            println!("setup_key: {key}");
+        }
+    }
+    save(dir, &store).await
+}
+fn create_spoke(s: &mut Store, name: String) -> (SpokeId, String) {
+    let id = SpokeId(format!("spoke_{}", Uuid::new_v4().simple()));
+    let key = secret("pps_setup");
+    let n = now();
+    s.spokes.insert(
+        id.clone(),
+        SpokeAuth {
+            record: SpokeRecord {
+                spoke_id: id.clone(),
+                name,
+                hostname: String::new(),
+                version: String::new(),
+                status: SpokeStatus::Offline,
+                created_at: n,
+                enrolled_at: None,
+                last_seen_at: None,
+            },
+            public_key: None,
+            setup_key_hash: Some(hash(&key)),
+            setup_expires_at: Some(n + 1800),
+            projects: BTreeMap::new(),
+        },
+    );
+    (id, key)
+}
+async fn serve(data: PathBuf, listen: String, public_url: String) -> Result<()> {
+    tokio::fs::create_dir_all(&data).await?;
+    let master_key = load_master_key(&data).await?;
+    let mut initial_store = load(&data).await?;
+    for spoke in initial_store.spokes.values_mut() {
+        if spoke.record.status == SpokeStatus::Online {
+            spoke.record.status = SpokeStatus::Offline;
+        }
+    }
+    save(&data, &initial_store).await?;
+    let app = App {
+        store: Arc::new(Mutex::new(initial_store)),
+        spokes: Default::default(),
+        clients: Default::default(),
+        subs: Default::default(),
+        pending: Default::default(),
+        data,
+        public_url,
+        master_key,
     };
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/api/nodes", get(list_nodes_http).post(create_node_http))
-        .route("/api/nodes/{node_id}/setup-key", post(issue_setup_key_http))
-        .route("/api/nodes/{node_id}/revoke", post(revoke_node_http))
-        .route("/api/nodes/{node_id}/disable", post(disable_node_http))
+    let router = Router::new()
         .route(
-            "/api/nodes/{node_id}/rotate-key",
-            post(rotate_node_key_http),
+            "/health",
+            get(|| async { Json(json!({"ok":true,"protocol_version":PROTOCOL_VERSION})) }),
         )
-        .route("/api/nodes/enroll", post(enroll_node_http))
-        .route("/ws/node", get(node_ws))
+        .route("/api/spokes/enroll", post(http_enroll))
+        .route("/ws/spoke", get(spoke_ws))
         .route("/ws/client", get(client_ws))
-        .with_state(state);
-
-    info!(listen = %args.listen, "starting PumpkinPi hub");
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    axum::serve(listener, app).await?;
+        .with_state(app);
+    let l = tokio::net::TcpListener::bind(&listen).await?;
+    info!(%listen,"PumpkinPi personal Hub listening");
+    axum::serve(l, router).await?;
     Ok(())
 }
-
-async fn hub_node_cli(args: NodeCommand) -> Result<()> {
-    let data_dir = args.data_dir.unwrap_or_else(default_hub_data_dir);
-    let mut store = HubStore::load(&data_dir).await?;
-    match args.command {
-        NodeSubcommand::Create { name } => {
-            let (node, setup_key) = store.create_node(name);
-            store.save(&data_dir).await?;
-            println!("node_id: {}", node.node_id);
-            println!("setup_key: {setup_key}");
-            println!("\nRun on node:");
-            println!("pumpkinpi node enroll --hub <hub-url> --setup-key {setup_key}");
-        }
-        NodeSubcommand::List => {
-            for node in store.nodes.values() {
-                println!(
-                    "{}\t{}\t{:?}\tlast_seen={}",
-                    node.node_id,
-                    node.name,
-                    node.status,
-                    node.last_seen_at.map_or("-".into(), |t| t.to_string())
-                );
-            }
-        }
-        NodeSubcommand::Revoke { node_id } => {
-            store.revoke_node(&node_id)?;
-            store.save(&data_dir).await?;
-            println!("revoked {node_id}");
-        }
-        NodeSubcommand::IssueSetupKey { node_id } => {
-            let setup_key = store.issue_setup_key(&node_id)?;
-            store.save(&data_dir).await?;
-            println!("node_id: {node_id}");
-            println!("setup_key: {setup_key}");
-        }
-        NodeSubcommand::Disable { node_id } => {
-            store.disable_node(&node_id)?;
-            store.save(&data_dir).await?;
-            println!("disabled {node_id}");
-        }
-        NodeSubcommand::RotateKey { node_id } => {
-            let setup_key = store.rotate_node_key(&node_id)?;
-            store.save(&data_dir).await?;
-            println!("node_id: {node_id}");
-            println!("setup_key: {setup_key}");
-        }
-    }
-    Ok(())
-}
-
-async fn hub_user_cli(args: UserCommand) -> Result<()> {
-    let data_dir = args.data_dir.unwrap_or_else(default_hub_data_dir);
-    let mut store = HubStore::load(&data_dir).await?;
-    match args.command {
-        UserSubcommand::Create { username } => {
-            let (user, token) = store.create_user(username);
-            store.save(&data_dir).await?;
-            println!("user_id: {}", user.user_id);
-            println!("token: {token}");
-            println!();
-            println!("Client login:");
-            println!("pumpkinpi login --hub ws://127.0.0.1:8080/ws/client --token {token}");
-        }
-        UserSubcommand::List => {
-            for user in store.users.values() {
-                println!("{}\t{}", user.user_id, user.username);
-            }
-        }
-        UserSubcommand::GrantNode { user_id, node_id } => {
-            store.grant_node_access(&user_id, &node_id)?;
-            store.save(&data_dir).await?;
-            println!("granted user {user_id} access to node {node_id}");
-        }
-    }
-    Ok(())
-}
-
-async fn hub_provider_cli(args: ProviderCommand) -> Result<()> {
-    let data_dir = args.data_dir.unwrap_or_else(default_hub_data_dir);
-    let mut store = HubStore::load(&data_dir).await?;
-    match args.command {
-        ProviderSubcommand::AddApiKey {
-            user_id,
-            provider_id,
-            display_name,
-            api_key,
-        } => {
-            let account =
-                store.add_provider_api_key(user_id, provider_id, display_name, api_key)?;
-            store.save(&data_dir).await?;
-            println!("provider_account_id: {}", account.provider_account_id);
-        }
-        ProviderSubcommand::List { user_id } => {
-            for account in store
-                .provider_accounts
-                .values()
-                .filter(|account| account.user_id == user_id && account.revoked_at.is_none())
-            {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    account.provider_account_id,
-                    account.provider_id,
-                    account.display_name,
-                    account.auth_type
-                );
-            }
-        }
-        ProviderSubcommand::Revoke {
-            provider_account_id,
-        } => {
-            store.revoke_provider_account(&provider_account_id)?;
-            store.save(&data_dir).await?;
-            println!("revoked provider account {provider_account_id}");
-        }
-    }
-    Ok(())
-}
-
-async fn health() -> impl IntoResponse {
-    Json(
-        json!({"ok": true, "service": "pumpkinpi-hub", "version": VERSION, "protocol_version": PROTOCOL_VERSION}),
-    )
-}
-
-async fn list_nodes_http(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let store = state.store.lock().await;
-    Json(
-        json!({"protocol_version": PROTOCOL_VERSION, "nodes": store.nodes.values().collect::<Vec<_>>() }),
-    )
-}
-
-async fn create_node_http(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CreateNodeHttp>,
-) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let mut store = state.store.lock().await;
-    let (node, setup_key) = store.create_node(body.name);
-    if let Err(err) = store.save(&state.data_dir).await {
-        error!(?err, "failed to save hub store");
-    }
-    Json(json!({"node": node, "setup_key": setup_key}))
-}
-
-async fn issue_setup_key_http(
-    State(state): State<AppState>,
-    AxumPath(node_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let mut store = state.store.lock().await;
-    match store.issue_setup_key(&node_id) {
-        Ok(setup_key) => {
-            if let Err(err) = store.save(&state.data_dir).await {
-                error!(?err, "failed to save hub store");
-            }
-            Json(json!({"node_id": node_id, "setup_key": setup_key}))
-        }
-        Err(err) => Json(json!({"error": err.to_string()})),
-    }
-}
-
-async fn revoke_node_http(
-    State(state): State<AppState>,
-    AxumPath(node_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let result = {
-        let mut store = state.store.lock().await;
-        let result = store.revoke_node(&node_id);
-        if result.is_ok() {
-            if let Err(err) = store.save(&state.data_dir).await {
-                error!(?err, "failed to save hub store");
-            }
-        }
-        result
-    };
-    match result {
-        Ok(()) => {
-            disconnect_node(&state, &node_id).await;
-            Json(json!({"protocol_version": PROTOCOL_VERSION, "node_id": node_id, "revoked": true}))
-        }
-        Err(err) => Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()})),
-    }
-}
-
-async fn disable_node_http(
-    State(state): State<AppState>,
-    AxumPath(node_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let result = {
-        let mut store = state.store.lock().await;
-        let result = store.disable_node(&node_id);
-        if result.is_ok() {
-            if let Err(err) = store.save(&state.data_dir).await {
-                error!(?err, "failed to save hub store");
-            }
-        }
-        result
-    };
-    match result {
-        Ok(()) => {
-            disconnect_node(&state, &node_id).await;
-            Json(
-                json!({"protocol_version": PROTOCOL_VERSION, "node_id": node_id, "disabled": true}),
-            )
-        }
-        Err(err) => Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()})),
-    }
-}
-
-async fn rotate_node_key_http(
-    State(state): State<AppState>,
-    AxumPath(node_id): AxumPath<String>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(err) = require_admin_http(&state, &headers) {
-        return Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()}));
-    }
-    let result = {
-        let mut store = state.store.lock().await;
-        let result = store.rotate_node_key(&node_id);
-        if result.is_ok() {
-            if let Err(err) = store.save(&state.data_dir).await {
-                error!(?err, "failed to save hub store");
-            }
-        }
-        result
-    };
-    match result {
-        Ok(setup_key) => {
-            disconnect_node(&state, &node_id).await;
-            Json(
-                json!({"protocol_version": PROTOCOL_VERSION, "node_id": node_id, "setup_key": setup_key}),
-            )
-        }
-        Err(err) => Json(json!({"protocol_version": PROTOCOL_VERSION, "error": err.to_string()})),
-    }
-}
-
-async fn enroll_node_http(
-    State(state): State<AppState>,
-    Json(body): Json<EnrollRequest>,
-) -> impl IntoResponse {
-    if body.protocol_version != PROTOCOL_VERSION {
-        return Json(
-            json!({"type": "error", "error": format!("unsupported protocol_version {}; expected {}", body.protocol_version, PROTOCOL_VERSION)}),
+async fn http_enroll(State(app): State<App>, Json(body): Json<EnrollRequest>) -> impl IntoResponse {
+    if let Err(error) = refresh_admin_state(&app).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(EnrollResponse {
+                ok: false,
+                spoke_id: None,
+                hub_url: None,
+                error: Some(error.to_string()),
+            }),
         );
     }
-    let mut store = state.store.lock().await;
-    match store.enroll_node(body, &state.public_url) {
-        Ok(response) => {
-            if let Err(err) = store.save(&state.data_dir).await {
-                error!(?err, "failed to save hub store");
-            }
-            Json(json!(response))
+    let mut s = app.store.lock().await;
+    let found = s.spokes.iter_mut().find(|(_, v)| {
+        v.setup_key_hash.as_deref() == Some(hash(&body.setup_key).as_str())
+            && v.setup_expires_at.is_some_and(|x| x >= now())
+    });
+    let response = if let Some((id, v)) = found {
+        v.public_key = Some(body.public_key);
+        v.setup_key_hash = None;
+        v.setup_expires_at = None;
+        v.record.hostname = body.hostname;
+        v.record.version = body.version;
+        v.record.enrolled_at = Some(now());
+        EnrollResponse {
+            ok: true,
+            spoke_id: Some(id.clone()),
+            hub_url: Some(app.public_url.clone()),
+            error: None,
         }
-        Err(err) => Json(json!({"type": "error", "error": err.to_string()})),
+    } else {
+        EnrollResponse {
+            ok: false,
+            spoke_id: None,
+            hub_url: None,
+            error: Some("invalid or expired setup key".into()),
+        }
+    };
+    let _ = save(&app.data, &s).await;
+    (
+        if response.ok {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        },
+        Json(response),
+    )
+}
+async fn spoke_ws(ws: WebSocketUpgrade, State(app): State<App>) -> impl IntoResponse {
+    ws.on_upgrade(move |s| handle_spoke(s, app))
+}
+async fn client_ws(ws: WebSocketUpgrade, State(app): State<App>) -> impl IntoResponse {
+    ws.on_upgrade(move |s| handle_client(s, app))
+}
+
+async fn handle_spoke(socket: WebSocket, app: App) {
+    if let Err(e) = spoke_session(socket, app.clone()).await {
+        warn!(error=%e,"spoke disconnected")
     }
 }
-
-async fn node_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_node_socket(socket, state))
-}
-
-async fn client_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_client_socket(socket, state))
-}
-
-async fn handle_node_socket(socket: WebSocket, state: AppState) {
+async fn spoke_session(socket: WebSocket, app: App) -> Result<()> {
     let (mut sink, mut stream) = socket.split();
-    let Some(Ok(Message::Text(text))) = stream.next().await else {
-        return;
+    let hello: SpokeToHub = parse_text(stream.next().await.context("missing hello")??)?;
+    let SpokeToHub::Hello {
+        protocol_version,
+        spoke_id,
+        version,
+    } = hello
+    else {
+        return Err(anyhow!("first message must be hello"));
     };
-    let hello: Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
-        Err(_) => return,
+    check_version(protocol_version)?;
+    let nonce = secret("challenge");
+    sink.send(Message::Text(
+        json!({"type":"spoke_challenge","nonce":nonce})
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    let auth: SpokeToHub = parse_text(stream.next().await.context("missing auth")??)?;
+    let SpokeToHub::Auth {
+        spoke_id: auth_id,
+        signature,
+        ..
+    } = auth
+    else {
+        return Err(anyhow!("missing auth"));
     };
-    if let Err(err) = require_protocol_version(&hello) {
-        warn!(%err, "node websocket protocol mismatch");
-        return;
+    if auth_id != spoke_id {
+        return Err(anyhow!("identity changed"));
     }
-    let node_id = hello
-        .get("node_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if hello.get("type").and_then(Value::as_str) != Some("node.hello") {
-        warn!(%node_id, "node websocket expected node.hello");
-        return;
-    }
-
-    let nonce = new_nonce();
-    let expires_at = now_secs() + 60;
-    let challenge = ChallengeMessage {
-        kind: "node.challenge",
-        protocol_version: PROTOCOL_VERSION,
-        nonce: nonce.clone(),
-        expires_at,
-    };
-    if sink
-        .send(Message::Text(json!(challenge).to_string().into()))
-        .await
-        .is_err()
     {
-        return;
-    }
-    let Some(Ok(Message::Text(auth_text))) = stream.next().await else {
-        return;
-    };
-    if let Err(err) = authenticate_node(&state, &node_id, &nonce, expires_at, &auth_text).await {
-        warn!(%node_id, %err, "node websocket auth failed");
-        return;
-    }
-    if sink
-        .send(Message::Text(
-            json!({"protocol_version": PROTOCOL_VERSION, "type":"node.authenticated", "heartbeat_interval_ms":30000})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let (tx, rx) = mpsc::unbounded_channel::<Message>();
-    state.node_channels.lock().await.insert(node_id.clone(), tx);
-    let writer = tokio::spawn(write_socket(sink, rx));
-
-    while let Some(msg) = stream.next().await {
-        match msg {
-            Ok(Message::Text(text)) => handle_node_message(&state, &node_id, &text).await,
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+        let mut store = app.store.lock().await;
+        let rec = store.spokes.get_mut(&spoke_id).context("unknown spoke")?;
+        let public = BASE64.decode(rec.public_key.as_deref().context("spoke is not enrolled")?)?;
+        let key =
+            VerifyingKey::from_bytes(&public.try_into().map_err(|_| anyhow!("bad public key"))?)?;
+        key.verify(
+            nonce.as_bytes(),
+            &Signature::from_slice(&BASE64.decode(signature)?)?,
+        )?;
+        if matches!(
+            rec.record.status,
+            SpokeStatus::Disabled | SpokeStatus::Revoked
+        ) {
+            return Err(anyhow!("spoke disabled"));
         }
+        rec.record.status = SpokeStatus::Online;
+        rec.record.version = version;
+        rec.record.last_seen_at = Some(now());
+        save(&app.data, &store).await?
     }
-
-    state.node_channels.lock().await.remove(&node_id);
-    {
-        let mut store = state.store.lock().await;
-        if let Some(node) = store.nodes.get_mut(&node_id) {
-            if node.status == NodeStatus::Online {
-                node.status = NodeStatus::Offline;
+    sink.send(Message::Text(
+        json!({"type":"spoke_authenticated"}).to_string().into(),
+    ))
+    .await?;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    app.spokes.lock().await.insert(spoke_id.clone(), tx);
+    let writer = tokio::spawn(async move {
+        while let Some(v) = rx.recv().await {
+            if sink.send(v).await.is_err() {
+                break;
             }
         }
-        let _ = store.save(&state.data_dir).await;
-    }
-    writer.abort();
-}
-
-async fn handle_client_socket(socket: WebSocket, state: AppState) {
-    let (sink, mut stream) = socket.split();
-    let (tx, rx) = mpsc::unbounded_channel::<Message>();
-    let client_id = Uuid::new_v4().to_string();
-    state
-        .client_channels
-        .lock()
-        .await
-        .insert(client_id.clone(), tx);
-    let writer = tokio::spawn(write_socket(sink, rx));
-    let Some(Ok(Message::Text(auth_text))) = stream.next().await else {
-        state.client_channels.lock().await.remove(&client_id);
-        writer.abort();
-        return;
-    };
-    let user_id = match authenticate_client(&state, &auth_text).await {
-        Ok(user_id) => {
-            state
-                .client_users
-                .lock()
-                .await
-                .insert(client_id.clone(), user_id.clone());
-            send_client_json(
-                &state,
-                &client_id,
-                json!({"protocol_version": PROTOCOL_VERSION, "type":"client.authenticated", "user_id": user_id}),
-            )
-            .await;
-            user_id
-        }
-        Err(err) => {
-            send_client_json(
-                &state,
-                &client_id,
-                json!({"protocol_version": PROTOCOL_VERSION, "type":"error", "error": err.to_string()}),
-            )
-            .await;
-            state.client_channels.lock().await.remove(&client_id);
-            writer.abort();
-            return;
-        }
-    };
+    });
+    broadcast_spoke(&app, &spoke_id).await;
     while let Some(msg) = stream.next().await {
-        let Ok(Message::Text(text)) = msg else {
-            continue;
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(error) => {
+                warn!(%spoke_id, %error, "Spoke socket closed with an error");
+                break;
+            }
         };
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(err) => {
-                send_client_json(
-                    &state,
-                    &client_id,
-                    json!({"protocol_version": PROTOCOL_VERSION, "type":"error", "error": err.to_string()}),
-                )
-                .await;
+        let msg: SpokeToHub = match parse_text(msg) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(%spoke_id, %error, "Ignoring invalid Spoke frame");
                 continue;
             }
         };
-        if let Err(err) = require_protocol_version(&value) {
-            send_client_json(
-                &state,
-                &client_id,
-                json!({"protocol_version": PROTOCOL_VERSION, "type":"error", "error": err.to_string()}),
-            )
+        match msg {
+            SpokeToHub::Inventory {
+                protocol_version,
+                projects,
+                ..
+            } => {
+                check_version(protocol_version)?;
+                let mut s = app.store.lock().await;
+                if let Some(v) = s.spokes.get_mut(&spoke_id) {
+                    v.projects = projects
+                        .into_iter()
+                        .map(|p| (p.project_id.clone(), p))
+                        .collect();
+                    v.record.last_seen_at = Some(now())
+                }
+                save(&app.data, &s).await?
+            }
+            SpokeToHub::Heartbeat { protocol_version } => {
+                check_version(protocol_version)?;
+                if let Some(v) = app.store.lock().await.spokes.get_mut(&spoke_id) {
+                    v.record.last_seen_at = Some(now())
+                }
+            }
+            SpokeToHub::ClientEvent {
+                protocol_version,
+                event,
+            } => {
+                check_version(protocol_version)?;
+                deliver(&app, &spoke_id, *event).await
+            }
+            _ => {}
+        }
+    }
+    app.spokes.lock().await.remove(&spoke_id);
+    {
+        let mut s = app.store.lock().await;
+        if let Some(v) = s.spokes.get_mut(&spoke_id) {
+            if v.record.status == SpokeStatus::Online {
+                v.record.status = SpokeStatus::Offline;
+            }
+            v.record.last_seen_at = Some(now());
+        }
+        let _ = save(&app.data, &s).await;
+    }
+    broadcast_spoke(&app, &spoke_id).await;
+    writer.abort();
+    Ok(())
+}
+
+async fn handle_client(socket: WebSocket, app: App) {
+    let (mut sink, mut stream) = socket.split();
+    let Some(Ok(first)) = stream.next().await else {
+        return;
+    };
+    let hello: ClientHello = match parse_text(first) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let ClientHello::Auth {
+        protocol_version,
+        token,
+    } = hello;
+    if check_version(protocol_version).is_err()
+        || app.store.lock().await.owner_token_hash.as_deref() != Some(hash(&token).as_str())
+    {
+        let _ = sink
+            .send(text_event(ClientEvent {
+                protocol_version: PROTOCOL_VERSION,
+                id: None,
+                payload: ClientPayload::Error {
+                    code: "authentication_failed".into(),
+                    message: "invalid owner credential".into(),
+                },
+            }))
             .await;
+        return;
+    }
+    let cid = Uuid::new_v4().to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    app.clients.lock().await.insert(cid.clone(), tx);
+    let writer = tokio::spawn(async move {
+        while let Some(v) = rx.recv().await {
+            if sink.send(v).await.is_err() {
+                break;
+            }
+        }
+    });
+    send_client(
+        &app,
+        &cid,
+        ClientEvent {
+            protocol_version: PROTOCOL_VERSION,
+            id: None,
+            payload: ClientPayload::Authenticated,
+        },
+    )
+    .await;
+    while let Some(Ok(msg)) = stream.next().await {
+        let req: ClientRequest = match parse_text(msg) {
+            Ok(v) => v,
+            Err(e) => {
+                send_error(&app, &cid, None, "invalid_request", &e.to_string()).await;
+                continue;
+            }
+        };
+        if let Err(e) = check_version(req.protocol_version) {
+            send_error(&app, &cid, Some(req.id), "protocol_version", &e.to_string()).await;
             continue;
         }
-        let id = value.get("id").cloned().unwrap_or(Value::Null);
-        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
-            "hub.status" => send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"hub.status.result", "version": VERSION})).await,
-            "node.list" => {
-                let store = state.store.lock().await;
-                let nodes = store
-                    .nodes
-                    .values()
-                    .filter(|node| store.user_can_access_node(&user_id, &node.node_id))
-                    .filter(|node| node.status != NodeStatus::Revoked && node.status != NodeStatus::Disabled)
-                    .collect::<Vec<_>>();
-                send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"node.list.result", "nodes": nodes })).await;
-            }
-            "node.get" => {
-                let Some(node_id) = value.get("node_id").and_then(Value::as_str) else {
-                    send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error":"node_id is required"})).await;
-                    continue;
-                };
-                let store = state.store.lock().await;
-                let node = store
-                    .nodes
-                    .get(node_id)
-                    .filter(|node| store.user_can_access_node(&user_id, &node.node_id));
-                if let Some(node) = node {
-                    send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"node.get.result", "node": node})).await;
-                } else {
-                    send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error":"node not found or access denied"})).await;
-                }
-            }
-            "session.attach" | "session.subscribe" => {
-                match session_key_from_value(&value) {
-                    Ok(key) => {
-                        if !user_can_access_node(&state, &user_id, &key.node_id).await {
-                            send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error":"access denied for node"})).await;
-                            continue;
-                        }
-                        state
-                            .subscriptions
-                            .lock()
-                            .await
-                            .entry(client_id.clone())
-                            .or_default()
-                            .insert(key.clone());
-                        send_subscription_snapshot(&state, &client_id, &id, &key).await;
-                    }
-                    Err(err) => send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error": err.to_string()})).await,
-                }
-            }
-            "session.detach" => {
-                match session_key_from_value(&value) {
-                    Ok(key) => {
-                        if let Some(keys) = state.subscriptions.lock().await.get_mut(&client_id) {
-                            keys.remove(&key);
-                        }
-                        send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"session.detach.result", "node_id": key.node_id, "project_id": key.project_id, "session_id": key.session_id})).await;
-                    }
-                    Err(err) => send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error": err.to_string()})).await,
-                }
-            }
-            command_type if command_type.starts_with("session.") || command_type.starts_with("project.") => {
-                route_client_request_to_node(&state, &client_id, &user_id, id, value).await;
-            }
-            other => send_client_json(&state, &client_id, json!({"protocol_version": PROTOCOL_VERSION, "id": id, "type":"error", "error": format!("unknown command type: {other}")})).await,
+        if let Err(e) = route_client(&app, &cid, req).await {
+            send_error(&app, &cid, None, "request_failed", &e.to_string()).await
         }
     }
-    state.client_channels.lock().await.remove(&client_id);
-    state.client_users.lock().await.remove(&client_id);
-    state.subscriptions.lock().await.remove(&client_id);
-    state
-        .in_flight
-        .lock()
-        .await
-        .retain(|_, pending| pending.client_id != client_id);
-    writer.abort();
+    app.clients.lock().await.remove(&cid);
+    app.subs.lock().await.remove(&cid);
+    app.pending.lock().await.retain(|_, v| v != &cid);
+    writer.abort()
 }
-
-fn require_protocol_version(value: &Value) -> Result<()> {
-    let version = value
-        .get("protocol_version")
-        .and_then(Value::as_u64)
-        .context("protocol_version is required")?;
-    if version != u64::from(PROTOCOL_VERSION) {
-        return Err(anyhow!(
-            "unsupported protocol_version {version}; expected {}",
-            PROTOCOL_VERSION
-        ));
+async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
+    refresh_admin_state(app).await?;
+    match &req.command {
+        ClientCommand::HubStatus => {
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::HubStatus {
+                        version: env!("CARGO_PKG_VERSION").into(),
+                    },
+                },
+            )
+            .await
+        }
+        ClientCommand::SpokeList => {
+            let spokes = app
+                .store
+                .lock()
+                .await
+                .spokes
+                .values()
+                .map(|x| x.record.clone())
+                .collect();
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::SpokeList { spokes },
+                },
+            )
+            .await
+        }
+        ClientCommand::ProjectList { spoke_id } => {
+            let s = app.store.lock().await;
+            let projects = s
+                .spokes
+                .iter()
+                .filter(|(id, _)| spoke_id.as_ref().is_none_or(|x| x == *id))
+                .flat_map(|(_, x)| x.projects.values().cloned())
+                .collect();
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::ProjectList { projects },
+                },
+            )
+            .await
+        }
+        ClientCommand::ProviderList => {
+            let accounts = app
+                .store
+                .lock()
+                .await
+                .providers
+                .iter()
+                .filter(|p| p.account.revoked_at.is_none())
+                .map(|p| p.account.clone())
+                .collect();
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::ProviderList { accounts },
+                },
+            )
+            .await
+        }
+        ClientCommand::ProviderSet {
+            provider_id,
+            label,
+            api_key,
+        } => {
+            let stored =
+                encrypt_provider(&app.master_key, provider_id.clone(), label.clone(), api_key)?;
+            let mut store = app.store.lock().await;
+            store
+                .providers
+                .retain(|p| p.account.provider_id != *provider_id || p.account.label != *label);
+            store.providers.push(stored);
+            let accounts = store
+                .providers
+                .iter()
+                .filter(|p| p.account.revoked_at.is_none())
+                .map(|p| p.account.clone())
+                .collect();
+            save(&app.data, &store).await?;
+            drop(store);
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::ProviderList { accounts },
+                },
+            )
+            .await
+        }
+        ClientCommand::ProviderRevoke {
+            provider_account_id,
+        } => {
+            let mut store = app.store.lock().await;
+            let provider = store
+                .providers
+                .iter_mut()
+                .find(|p| p.account.provider_account_id == *provider_account_id)
+                .context("provider account not found")?;
+            provider.account.revoked_at = Some(now());
+            let accounts = store
+                .providers
+                .iter()
+                .filter(|p| p.account.revoked_at.is_none())
+                .map(|p| p.account.clone())
+                .collect();
+            save(&app.data, &store).await?;
+            drop(store);
+            send_client(
+                app,
+                cid,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: Some(req.id),
+                    payload: ClientPayload::ProviderList { accounts },
+                },
+            )
+            .await
+        }
+        _ => {
+            let spoke = req
+                .command
+                .spoke_id()
+                .context("missing spoke route")?
+                .clone();
+            let project = project_id(&req.command);
+            if let Some(pid) = project
+                && matches!(
+                    req.command,
+                    ClientCommand::IntentSubscribe { .. }
+                        | ClientCommand::IntentSend { .. }
+                        | ClientCommand::ProjectInitialize { .. }
+                )
+            {
+                app.subs
+                    .lock()
+                    .await
+                    .entry(cid.into())
+                    .or_default()
+                    .insert(ProjectKey {
+                        spoke_id: spoke.clone(),
+                        project_id: pid,
+                    });
+            }
+            let provider_env =
+                provider_env_for_request(app, &spoke, project_id(&req.command).as_ref()).await?;
+            let channel = app.spokes.lock().await.get(&spoke).cloned();
+            if let Some(channel) = channel {
+                app.pending
+                    .lock()
+                    .await
+                    .insert((spoke, req.id.clone()), cid.into());
+                channel.send(Message::Text(
+                    serde_json::to_string(&HubToSpoke::Command {
+                        request: req,
+                        provider_env,
+                    })?
+                    .into(),
+                ))?
+            } else if let ClientCommand::IntentSubscribe { project_id, .. } = &req.command {
+                let cached = app
+                    .store
+                    .lock()
+                    .await
+                    .snapshots
+                    .iter()
+                    .find(|s| s.project.project_id == *project_id && s.project.spoke_id == spoke)
+                    .cloned()
+                    .context("spoke is offline and no cached Intent Chat is available")?;
+                send_client(
+                    app,
+                    cid,
+                    ClientEvent {
+                        protocol_version: PROTOCOL_VERSION,
+                        id: Some(req.id),
+                        payload: ClientPayload::ProjectSnapshot {
+                            snapshot: Box::new(cached),
+                        },
+                    },
+                )
+                .await
+            } else {
+                return Err(anyhow!("spoke is offline"));
+            }
+        }
     }
     Ok(())
 }
-
-fn require_admin_http(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    let Some(expected) = &state.admin_token else {
-        return Err(anyhow!(
-            "admin HTTP API disabled; start hub with --admin-token or PUMPKINPI_ADMIN_TOKEN"
-        ));
-    };
-    let presented = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("x-pumpkinpi-admin-token")
-                .and_then(|value| value.to_str().ok())
-        })
-        .context("admin token is required")?;
-    if hash_secret(presented) != hash_secret(expected) {
-        return Err(anyhow!("invalid admin token"));
+async fn refresh_admin_state(app: &App) -> Result<()> {
+    let disk = load(&app.data).await?;
+    let mut disconnect = Vec::new();
+    {
+        let mut live = app.store.lock().await;
+        for (id, on_disk) in disk.spokes {
+            if let Some(spoke) = live.spokes.get_mut(&id) {
+                if matches!(
+                    on_disk.record.status,
+                    SpokeStatus::Disabled | SpokeStatus::Revoked
+                ) && spoke.record.status != on_disk.record.status
+                {
+                    spoke.record.status = on_disk.record.status;
+                    disconnect.push(id.clone());
+                }
+                if on_disk.setup_key_hash != spoke.setup_key_hash {
+                    spoke.setup_key_hash = on_disk.setup_key_hash;
+                    spoke.setup_expires_at = on_disk.setup_expires_at;
+                }
+            }
+        }
+        save(&app.data, &live).await?;
+    }
+    for id in disconnect {
+        if let Some(tx) = app.spokes.lock().await.remove(&id) {
+            let _ = tx.send(Message::Close(None));
+        }
     }
     Ok(())
 }
-
-async fn authenticate_client(state: &AppState, text: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(text).context("invalid client auth json")?;
-    require_protocol_version(&value)?;
-    if value.get("type").and_then(Value::as_str) != Some("client.auth") {
-        return Err(anyhow!("first client message must be client.auth"));
+fn project_id(c: &ClientCommand) -> Option<ProjectId> {
+    match c {
+        ClientCommand::ProjectGet { project_id, .. }
+        | ClientCommand::ProjectRemove { project_id, .. }
+        | ClientCommand::ProjectModelSet { project_id, .. }
+        | ClientCommand::IntentSubscribe { project_id, .. }
+        | ClientCommand::IntentSend { project_id, .. }
+        | ClientCommand::IntentCancel { project_id, .. }
+        | ClientCommand::IntentAnswer { project_id, .. }
+        | ClientCommand::IntentGetProjection { project_id, .. } => Some(project_id.clone()),
+        _ => None,
     }
-    let token = value
-        .get("token")
-        .and_then(Value::as_str)
-        .context("client auth token is required")?;
-    let store = state.store.lock().await;
-    store
-        .users
-        .values()
-        .find(|user| user.token_hash == hash_secret(token))
-        .map(|user| user.user_id.clone())
-        .context("invalid client auth token")
 }
-
-async fn user_can_access_node(state: &AppState, user_id: &str, node_id: &str) -> bool {
-    state
+async fn deliver(app: &App, spoke: &SpokeId, event: ClientEvent) {
+    cache_event(app, &event).await;
+    if let Some(id) = &event.id
+        && let Some(cid) = app
+            .pending
+            .lock()
+            .await
+            .remove(&(spoke.clone(), id.clone()))
+    {
+        if let ClientPayload::ProjectSnapshot { snapshot } = &event.payload {
+            app.subs
+                .lock()
+                .await
+                .entry(cid.clone())
+                .or_default()
+                .insert(ProjectKey {
+                    spoke_id: spoke.clone(),
+                    project_id: snapshot.project.project_id.clone(),
+                });
+            update_cached_project(app, spoke, &snapshot.project).await
+        }
+        send_client(app, &cid, event).await;
+        return;
+    }
+    let pid = payload_project(&event.payload);
+    if let Some(pid) = pid {
+        if let ClientPayload::ProjectUpdated { project } = &event.payload {
+            update_cached_project(app, spoke, project).await
+        }
+        let key = ProjectKey {
+            spoke_id: spoke.clone(),
+            project_id: pid,
+        };
+        let recipients = app
+            .subs
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(c, s)| s.contains(&key).then_some(c.clone()))
+            .collect::<Vec<_>>();
+        for c in recipients {
+            send_client(app, &c, event.clone()).await
+        }
+    }
+}
+async fn cache_event(app: &App, event: &ClientEvent) {
+    let mut store = app.store.lock().await;
+    match &event.payload {
+        ClientPayload::ProjectSnapshot { snapshot } => {
+            if let Some(old) = store.snapshots.iter_mut().find(|s| {
+                s.project.project_id == snapshot.project.project_id
+                    && s.project.spoke_id == snapshot.project.spoke_id
+            }) {
+                old.project = snapshot.project.clone();
+                old.source = snapshot.source.clone();
+                old.chat = snapshot.chat.clone();
+                for item in &snapshot.timeline {
+                    if !old
+                        .timeline
+                        .iter()
+                        .any(|x| x.timeline_item_id == item.timeline_item_id)
+                    {
+                        old.timeline.push(item.clone())
+                    }
+                }
+                old.operations = snapshot.operations.clone();
+            } else {
+                store.snapshots.push((**snapshot).clone());
+            }
+        }
+        ClientPayload::Timeline { item } => {
+            if let Some(s) = store.snapshots.iter_mut().find(|s| {
+                s.project.project_id == item.project_id && s.project.spoke_id == item.spoke_id
+            }) && !s
+                .timeline
+                .iter()
+                .any(|x| x.timeline_item_id == item.timeline_item_id)
+            {
+                s.timeline.push(item.clone())
+            }
+        }
+        ClientPayload::Operation { operation } | ClientPayload::Accepted { operation } => {
+            if let Some(s) = store.snapshots.iter_mut().find(|s| {
+                s.project.project_id == operation.project_id
+                    && s.project.spoke_id == operation.spoke_id
+            }) {
+                if let Some(old) = s
+                    .operations
+                    .iter_mut()
+                    .find(|x| x.operation_id == operation.operation_id)
+                {
+                    *old = operation.clone()
+                } else {
+                    s.operations.push(operation.clone())
+                }
+            }
+        }
+        ClientPayload::ProjectUpdated { project } => {
+            if let Some(s) = store.snapshots.iter_mut().find(|s| {
+                s.project.project_id == project.project_id && s.project.spoke_id == project.spoke_id
+            }) {
+                s.project = project.clone()
+            }
+        }
+        _ => {}
+    }
+    let _ = save(&app.data, &store).await;
+}
+fn payload_project(p: &ClientPayload) -> Option<ProjectId> {
+    match p {
+        ClientPayload::Timeline { item } => Some(item.project_id.clone()),
+        ClientPayload::Interaction { project_id, .. } => Some(project_id.clone()),
+        ClientPayload::Operation { operation } | ClientPayload::Accepted { operation } => {
+            Some(operation.project_id.clone())
+        }
+        ClientPayload::ProjectUpdated { project } => Some(project.project_id.clone()),
+        ClientPayload::ProjectSnapshot { snapshot } => Some(snapshot.project.project_id.clone()),
+        ClientPayload::ReplayGap { project_id, .. } => Some(project_id.clone()),
+        _ => None,
+    }
+}
+async fn update_cached_project(app: &App, spoke: &SpokeId, p: &ProjectRecord) {
+    let mut s = app.store.lock().await;
+    if let Some(v) = s.spokes.get_mut(spoke) {
+        v.projects.insert(p.project_id.clone(), p.clone());
+    }
+    let _ = save(&app.data, &s).await;
+}
+async fn broadcast_spoke(app: &App, id: &SpokeId) {
+    let spoke = app
         .store
         .lock()
         .await
-        .user_can_access_node(user_id, node_id)
-}
-
-async fn route_client_request_to_node(
-    state: &AppState,
-    client_id: &str,
-    user_id: &str,
-    external_id: Value,
-    mut value: Value,
-) {
-    let Some(node_id) = value
-        .get("node_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        send_client_json(
-            state,
-            client_id,
-            json!({"protocol_version": PROTOCOL_VERSION, "id": external_id, "type":"error", "error":"node_id is required"}),
-        )
-        .await;
-        return;
-    };
-    if !user_can_access_node(state, user_id, &node_id).await {
-        send_client_json(
-            state,
-            client_id,
-            json!({"protocol_version": PROTOCOL_VERSION, "id": external_id, "type":"error", "error":"access denied for node"}),
-        )
-        .await;
-        return;
-    }
-    if let Some(provider_account_id) = value
-        .get("provider_account_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    {
-        match provider_env_for_request(state, user_id, &provider_account_id).await {
-            Ok(provider_env) => value["provider_env"] = provider_env,
-            Err(err) => {
-                send_client_json(
-                    state,
-                    client_id,
-                    json!({"protocol_version": PROTOCOL_VERSION, "id": external_id, "type":"error", "error": err.to_string()}),
-                )
-                .await;
-                return;
-            }
-        }
-    }
-
-    let hub_id = format!("hub_{}", Uuid::new_v4().simple());
-    value["id"] = Value::String(hub_id.clone());
-    value["protocol_version"] = json!(PROTOCOL_VERSION);
-    value["origin_client_id"] = Value::String(client_id.to_string());
-    value["origin_user_id"] = Value::String(user_id.to_string());
-    value["origin_external_id"] = external_id.clone();
-
-    let tx = state.node_channels.lock().await.get(&node_id).cloned();
-    if let Some(tx) = tx {
-        audit_log(state, json!({"event":"client.request.routed", "user_id": user_id, "client_id": client_id, "node_id": node_id, "type": value.get("type").and_then(Value::as_str)})).await;
-        state.in_flight.lock().await.insert(
-            hub_id.clone(),
-            PendingRequest {
-                client_id: client_id.to_string(),
-                external_id: external_id.clone(),
-            },
-        );
-        if tx.send(Message::Text(value.to_string().into())).is_err() {
-            state.in_flight.lock().await.remove(&hub_id);
-            send_client_json(
-                state,
-                client_id,
-                json!({"protocol_version": PROTOCOL_VERSION, "id": external_id, "type":"error", "error":"failed to route request to node"}),
+        .spokes
+        .get(id)
+        .map(|x| x.record.clone());
+    if let Some(spoke) = spoke {
+        let clients = app.clients.lock().await.keys().cloned().collect::<Vec<_>>();
+        for c in clients {
+            send_client(
+                app,
+                &c,
+                ClientEvent {
+                    protocol_version: PROTOCOL_VERSION,
+                    id: None,
+                    payload: ClientPayload::SpokeUpdated {
+                        spoke: spoke.clone(),
+                    },
+                },
             )
-            .await;
+            .await
         }
-    } else {
-        send_client_json(
-            state,
-            client_id,
-            json!({"protocol_version": PROTOCOL_VERSION, "id": external_id, "type":"error", "error":"node is offline"}),
-        )
-        .await;
     }
 }
-
-async fn provider_env_for_request(
-    state: &AppState,
-    user_id: &str,
-    provider_account_id: &str,
-) -> Result<Value> {
-    let store = state.store.lock().await;
-    let (provider_id, secret) = store.provider_account_secret(user_id, provider_account_id)?;
-    let env_name = provider_api_key_env_name(&provider_id)?;
-    Ok(json!({env_name: secret}))
+async fn send_error(app: &App, c: &str, id: Option<RequestId>, code: &str, msg: &str) {
+    send_client(
+        app,
+        c,
+        ClientEvent {
+            protocol_version: PROTOCOL_VERSION,
+            id,
+            payload: ClientPayload::Error {
+                code: code.into(),
+                message: msg.into(),
+            },
+        },
+    )
+    .await
 }
-
-fn provider_api_key_env_name(provider_id: &str) -> Result<&'static str> {
-    match provider_id {
+async fn send_client(app: &App, c: &str, event: ClientEvent) {
+    if let Some(tx) = app.clients.lock().await.get(c) {
+        let _ = tx.send(text_event(event));
+    }
+}
+fn text_event(e: ClientEvent) -> Message {
+    Message::Text(serde_json::to_string(&e).unwrap().into())
+}
+fn parse_text<T: for<'a> Deserialize<'a>>(m: Message) -> Result<T> {
+    let Message::Text(t) = m else {
+        return Err(anyhow!("expected text"));
+    };
+    Ok(serde_json::from_str(&t)?)
+}
+fn check_version(v: u32) -> Result<()> {
+    if v != PROTOCOL_VERSION {
+        Err(anyhow!(
+            "unsupported protocol {v}; expected {PROTOCOL_VERSION}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn encrypt_provider(
+    key: &[u8; 32],
+    provider_id: String,
+    label: String,
+    api_key: &str,
+) -> Result<StoredProvider> {
+    let cipher = Aes256Gcm::new_from_slice(key)?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), api_key.as_bytes())
+        .map_err(|_| anyhow!("provider encryption failed"))?;
+    Ok(StoredProvider {
+        account: ProviderAccount {
+            provider_account_id: format!("provider_{}", Uuid::new_v4().simple()),
+            provider_id,
+            label,
+            created_at: now(),
+            revoked_at: None,
+        },
+        nonce: BASE64.encode(nonce),
+        ciphertext: BASE64.encode(ciphertext),
+    })
+}
+fn decrypt_provider(key: &[u8; 32], provider: &StoredProvider) -> Result<String> {
+    let cipher = Aes256Gcm::new_from_slice(key)?;
+    let nonce = BASE64.decode(&provider.nonce)?;
+    let ciphertext = BASE64.decode(&provider.ciphertext)?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| anyhow!("provider decryption failed"))?;
+    Ok(String::from_utf8(plaintext)?)
+}
+fn provider_env_name(provider: &str) -> Result<&'static str> {
+    match provider {
         "anthropic" => Ok("ANTHROPIC_API_KEY"),
         "openai" => Ok("OPENAI_API_KEY"),
         "google" | "gemini" => Ok("GOOGLE_API_KEY"),
         "xai" => Ok("XAI_API_KEY"),
         "openrouter" => Ok("OPENROUTER_API_KEY"),
-        other => Err(anyhow!("unsupported provider API-key env mapping: {other}")),
+        _ => Err(anyhow!("unsupported provider {provider}")),
     }
 }
-
-fn redact_sensitive_value(mut value: Value) -> Value {
-    match &mut value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                let sensitive = matches!(
-                    key.as_str(),
-                    "provider_env"
-                        | "api_key"
-                        | "token"
-                        | "setup_key"
-                        | "authorization"
-                        | "message"
-                        | "command"
-                        | "stdout"
-                        | "stderr"
-                        | "cwd"
-                        | "path"
-                        | "args"
-                ) || key.to_ascii_lowercase().contains("secret");
-                if sensitive {
-                    *child = Value::String("<redacted>".to_string());
-                } else {
-                    *child = redact_sensitive_value(std::mem::take(child));
-                }
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                *child = redact_sensitive_value(std::mem::take(child));
-            }
-        }
-        _ => {}
-    }
-    value
-}
-
-fn merge_inventory_records(existing: &mut Vec<Value>, incoming: Vec<Value>, id_field: &str) {
-    for record in incoming {
-        let Some(id) = record
-            .get(id_field)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if let Some(slot) = existing
-            .iter_mut()
-            .find(|candidate| candidate.get(id_field).and_then(Value::as_str) == Some(id.as_str()))
-        {
-            let incoming_updated_at = record
-                .get("updated_at")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let existing_updated_at = slot.get("updated_at").and_then(Value::as_u64).unwrap_or(0);
-            if incoming_updated_at >= existing_updated_at {
-                *slot = record;
-            }
-        } else {
-            existing.push(record);
-        }
-    }
-}
-
-fn session_key_from_value(value: &Value) -> Result<SessionKey> {
-    Ok(SessionKey {
-        node_id: value
-            .get("node_id")
-            .and_then(Value::as_str)
-            .context("node_id is required")?
-            .to_string(),
-        project_id: value
-            .get("project_id")
-            .and_then(Value::as_str)
-            .context("project_id is required")?
-            .to_string(),
-        session_id: value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .context("session_id is required")?
-            .to_string(),
-    })
-}
-
-async fn authenticate_node(
-    state: &AppState,
-    node_id: &str,
-    nonce: &str,
-    expires_at: u64,
-    auth_text: &str,
-) -> Result<()> {
-    if now_secs() > expires_at {
-        return Err(anyhow!("node challenge expired"));
-    }
-    let auth: Value = serde_json::from_str(auth_text).context("invalid node.auth json")?;
-    require_protocol_version(&auth)?;
-    if auth.get("type").and_then(Value::as_str) != Some("node.auth") {
-        return Err(anyhow!("expected node.auth"));
-    }
-    if auth.get("node_id").and_then(Value::as_str) != Some(node_id) {
-        return Err(anyhow!("node_id mismatch in node.auth"));
-    }
-    let signature_bytes = decode_base64_array::<64>(
-        auth.get("signature")
-            .and_then(Value::as_str)
-            .context("signature is required")?,
-    )?;
-    let public_key = {
-        let store = state.store.lock().await;
-        let node = store
-            .nodes
-            .get(node_id)
-            .filter(|node| {
-                node.status != NodeStatus::Revoked && node.status != NodeStatus::Disabled
-            })
-            .context("node not found or disabled")?;
-        node.public_key
-            .clone()
-            .context("node has no enrolled public key")?
+async fn provider_env_for_request(
+    app: &App,
+    spoke: &SpokeId,
+    project: Option<&ProjectId>,
+) -> Result<BTreeMap<String, String>> {
+    let Some(project) = project else {
+        return Ok(BTreeMap::new());
     };
-    let public_key_bytes = decode_base64_array::<32>(&public_key)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key_bytes).context("invalid node public key")?;
-    let signature = Signature::from_bytes(&signature_bytes);
-    verifying_key
-        .verify(nonce.as_bytes(), &signature)
-        .context("invalid node signature")?;
-
-    let mut store = state.store.lock().await;
-    if let Some(node) = store.nodes.get_mut(node_id) {
-        node.status = NodeStatus::Online;
-        node.last_seen_at = Some(now_secs());
-        for project in &mut node.projects {
-            project["status"] = Value::String("stale".to_string());
-        }
-        for session in &mut node.sessions {
-            session["status"] = Value::String("stale".to_string());
-        }
+    let store = app.store.lock().await;
+    let provider_id = store
+        .spokes
+        .get(spoke)
+        .and_then(|s| s.projects.get(project))
+        .and_then(|p| p.default_provider.as_deref());
+    let Some(provider_id) = provider_id else {
+        return Ok(BTreeMap::new());
+    };
+    let provider = store
+        .providers
+        .iter()
+        .find(|p| p.account.provider_id == provider_id && p.account.revoked_at.is_none())
+        .with_context(|| format!("no active credential for provider {provider_id}"))?;
+    Ok(BTreeMap::from([(
+        provider_env_name(provider_id)?.into(),
+        decrypt_provider(&app.master_key, provider)?,
+    )]))
+}
+async fn load_master_key(dir: &Path) -> Result<[u8; 32]> {
+    let path = dir.join("master.key");
+    if path.exists() {
+        let bytes = BASE64.decode(tokio::fs::read_to_string(path).await?.trim())?;
+        return bytes
+            .try_into()
+            .map_err(|_| anyhow!("invalid Hub master key"));
     }
-    store.save(&state.data_dir).await?;
-    audit_log(
-        state,
-        json!({"event":"node.authenticated", "node_id": node_id}),
-    )
-    .await;
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::write(&path, BASE64.encode(key)).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?
+    }
+    Ok(key)
+}
+async fn load(dir: &Path) -> Result<Store> {
+    let p = dir.join("hub-v3.json");
+    if !p.exists() {
+        return Ok(Store::default());
+    }
+    Ok(serde_json::from_slice(&tokio::fs::read(p).await?)?)
+}
+async fn save(dir: &Path, s: &Store) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let tmp = dir.join("hub-v3.tmp");
+    tokio::fs::write(&tmp, serde_json::to_vec_pretty(s)?).await?;
+    tokio::fs::rename(tmp, dir.join("hub-v3.json")).await?;
     Ok(())
-}
-
-async fn handle_node_message(state: &AppState, node_id: &str, text: &str) {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    if let Err(err) = require_protocol_version(&value) {
-        warn!(%node_id, %err, "dropping node message with protocol mismatch");
-        return;
-    }
-    match value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
-        "node.inventory" => {
-            let mut terminal_events = Vec::new();
-            {
-                let mut store = state.store.lock().await;
-                if let Some(node) = store.nodes.get_mut(node_id) {
-                    let complete = value
-                        .get("complete")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let revision = value
-                        .get("revision")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_else(now_secs);
-                    let projects = value
-                        .get("projects")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let sessions = value
-                        .get("sessions")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    if complete {
-                        let incoming_project_ids = projects
-                            .iter()
-                            .filter_map(|project| {
-                                project
-                                    .get("project_id")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .collect::<std::collections::HashSet<_>>();
-                        let incoming_session_ids = sessions
-                            .iter()
-                            .filter_map(|session| {
-                                session
-                                    .get("session_id")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .collect::<std::collections::HashSet<_>>();
-
-                        let mut reconciled_projects = projects;
-                        for old in &node.projects {
-                            let Some(project_id) = old.get("project_id").and_then(Value::as_str)
-                            else {
-                                continue;
-                            };
-                            if !incoming_project_ids.contains(project_id) {
-                                let mut stale = old.clone();
-                                stale["status"] = Value::String("stale".to_string());
-                                stale["updated_at"] = json!(revision);
-                                reconciled_projects.push(stale);
-                                terminal_events.push(json!({
-                                    "protocol_version": PROTOCOL_VERSION,
-                                    "type":"project.stale",
-                                    "node_id": node_id,
-                                    "project_id": project_id,
-                                    "reason":"absent_from_complete_inventory"
-                                }));
-                            } else if let Some(new_project) =
-                                reconciled_projects.iter().find(|project| {
-                                    project.get("project_id").and_then(Value::as_str)
-                                        == Some(project_id)
-                                })
-                            {
-                                if old.get("cwd") != new_project.get("cwd")
-                                    || old.get("name") != new_project.get("name")
-                                {
-                                    terminal_events.push(json!({
-                                        "protocol_version": PROTOCOL_VERSION,
-                                        "type":"project.updated",
-                                        "node_id": node_id,
-                                        "project_id": project_id,
-                                        "project": new_project
-                                    }));
-                                }
-                            }
-                        }
-
-                        let mut reconciled_sessions = sessions;
-                        for old in &node.sessions {
-                            let Some(session_id) = old.get("session_id").and_then(Value::as_str)
-                            else {
-                                continue;
-                            };
-                            if !incoming_session_ids.contains(session_id) {
-                                let project_id = old
-                                    .get("project_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                let mut stale = old.clone();
-                                stale["status"] = Value::String("stale".to_string());
-                                stale["updated_at"] = json!(revision);
-                                reconciled_sessions.push(stale);
-                                terminal_events.push(json!({
-                                    "protocol_version": PROTOCOL_VERSION,
-                                    "type":"session.stale",
-                                    "node_id": node_id,
-                                    "project_id": project_id,
-                                    "session_id": session_id,
-                                    "reason":"absent_from_complete_inventory"
-                                }));
-                            }
-                        }
-                        node.projects = reconciled_projects;
-                        node.sessions = reconciled_sessions;
-                    } else {
-                        merge_inventory_records(&mut node.projects, projects, "project_id");
-                        merge_inventory_records(&mut node.sessions, sessions, "session_id");
-                    }
-                    node.inventory_revision = Some(revision);
-                    node.last_seen_at = Some(now_secs());
-                }
-                let _ = store.save(&state.data_dir).await;
-            }
-            for event in terminal_events {
-                let key = session_key_from_value(&event).ok();
-                if key.is_some() {
-                    deliver_session_event(state, event).await;
-                } else {
-                    deliver_node_event(state, event).await;
-                }
-                if let Some(key) = key {
-                    state.subscriptions.lock().await.retain(|_, keys| {
-                        keys.remove(&key);
-                        !keys.is_empty()
-                    });
-                }
-            }
-        }
-        "node.heartbeat" => {
-            let mut store = state.store.lock().await;
-            if let Some(node) = store.nodes.get_mut(node_id) {
-                node.last_seen_at = Some(now_secs());
-            }
-            let _ = store.save(&state.data_dir).await;
-        }
-        _ => {
-            let mut event = value;
-            if event.get("node_id").is_none() {
-                event["node_id"] = Value::String(node_id.to_string());
-            }
-            if let Some(hub_id) = event.get("id").and_then(Value::as_str).map(str::to_string) {
-                if let Some(pending) = state.in_flight.lock().await.remove(&hub_id) {
-                    event["id"] = pending.external_id;
-                    send_client_json(state, &pending.client_id, event).await;
-                    return;
-                }
-            }
-            if let Some(target_client_id) = event
-                .get("target_client_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            {
-                if state
-                    .client_channels
-                    .lock()
-                    .await
-                    .contains_key(&target_client_id)
-                {
-                    send_client_json(state, &target_client_id, event).await;
-                    return;
-                }
-            }
-            deliver_session_event(state, event).await;
-        }
-    }
-}
-
-async fn write_socket(
-    mut sink: SplitSink<WebSocket, Message>,
-    mut rx: mpsc::UnboundedReceiver<Message>,
-) {
-    while let Some(msg) = rx.recv().await {
-        if sink.send(msg).await.is_err() {
-            break;
-        }
-    }
-}
-
-async fn disconnect_node(state: &AppState, node_id: &str) {
-    if let Some(tx) = state.node_channels.lock().await.remove(node_id) {
-        let _ = tx.send(Message::Close(None));
-    }
-    let affected = {
-        let subscriptions = state.subscriptions.lock().await;
-        subscriptions
-            .iter()
-            .flat_map(|(_, keys)| keys.iter().filter(|key| key.node_id == node_id).cloned())
-            .collect::<std::collections::HashSet<_>>()
-    };
-    for key in affected {
-        deliver_session_event(
-            state,
-            json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "type":"session.revoked",
-                "node_id": key.node_id,
-                "project_id": key.project_id,
-                "session_id": key.session_id,
-                "reason":"node_disconnected_or_revoked"
-            }),
-        )
-        .await;
-    }
-    state.subscriptions.lock().await.retain(|_, keys| {
-        keys.retain(|key| key.node_id != node_id);
-        !keys.is_empty()
-    });
-}
-
-async fn send_client_json(state: &AppState, client_id: &str, value: Value) {
-    if let Some(tx) = state.client_channels.lock().await.get(client_id) {
-        let _ = tx.send(Message::Text(value.to_string().into()));
-    }
-}
-
-async fn audit_log(state: &AppState, mut event: Value) {
-    event["at"] = json!(now_secs());
-    let redacted = redact_audit_event(event);
-    let path = state.data_dir.join("audit.log");
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let mut line = redacted.to_string();
-    line.push('\n');
-    use tokio::io::AsyncWriteExt;
-    if let Ok(mut file) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-    {
-        let _ = file.write_all(line.as_bytes()).await;
-    }
-}
-
-fn redact_audit_event(event: Value) -> Value {
-    redact_sensitive_value(event)
-}
-
-async fn send_subscription_snapshot(
-    state: &AppState,
-    client_id: &str,
-    id: &Value,
-    key: &SessionKey,
-) {
-    let (project, session) = {
-        let store = state.store.lock().await;
-        let node = store.nodes.get(&key.node_id);
-        let project = node.and_then(|node| {
-            node.projects
-                .iter()
-                .find(|project| {
-                    project.get("project_id").and_then(Value::as_str)
-                        == Some(key.project_id.as_str())
-                })
-                .cloned()
-        });
-        let session = node.and_then(|node| {
-            node.sessions
-                .iter()
-                .find(|session| {
-                    session.get("session_id").and_then(Value::as_str)
-                        == Some(key.session_id.as_str())
-                })
-                .cloned()
-        });
-        (project, session)
-    };
-    let recent_events = match read_recent_session_events(&state.data_dir, key, 256).await {
-        Ok(events) if !events.is_empty() => events,
-        _ => state
-            .recent_events
-            .lock()
-            .await
-            .get(key)
-            .map(|events| events.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default(),
-    };
-    send_client_json(
-        state,
-        client_id,
-        json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "id": id,
-            "type":"session.subscribe.result",
-            "node_id": key.node_id,
-            "project_id": key.project_id,
-            "session_id": key.session_id,
-            "project": project,
-            "session": session,
-            "recent_events": recent_events,
-        }),
-    )
-    .await;
-}
-
-async fn deliver_node_event(state: &AppState, value: Value) {
-    let Some(node_id) = value
-        .get("node_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let recipients = {
-        let client_users = state.client_users.lock().await;
-        let store = state.store.lock().await;
-        client_users
-            .iter()
-            .filter_map(|(client_id, user_id)| {
-                store
-                    .user_can_access_node(user_id, &node_id)
-                    .then_some(client_id.clone())
-            })
-            .collect::<Vec<_>>()
-    };
-    let clients = state.client_channels.lock().await;
-    let message = Message::Text(value.to_string().into());
-    for client_id in recipients {
-        if let Some(tx) = clients.get(&client_id) {
-            let _ = tx.send(message.clone());
-        }
-    }
-}
-
-async fn deliver_session_event(state: &AppState, value: Value) {
-    let Ok(key) = session_key_from_value(&value) else {
-        return;
-    };
-    {
-        let mut recent = state.recent_events.lock().await;
-        let buffer = recent.entry(key.clone()).or_default();
-        if buffer.len() == 256 {
-            buffer.pop_front();
-        }
-        buffer.push_back(value.clone());
-    }
-    append_session_event_log(&state.data_dir, &key, &value).await;
-    let recipient_ids = {
-        let subscriptions = state.subscriptions.lock().await;
-        subscriptions
-            .iter()
-            .filter_map(|(client_id, keys)| keys.contains(&key).then_some(client_id.clone()))
-            .collect::<Vec<_>>()
-    };
-    let message = Message::Text(value.to_string().into());
-    let clients = state.client_channels.lock().await;
-    for client_id in recipient_ids {
-        if let Some(tx) = clients.get(&client_id) {
-            let _ = tx.send(message.clone());
-        }
-    }
-}
-
-async fn append_session_event_log(data_dir: &Path, key: &SessionKey, value: &Value) {
-    let path = session_event_log_path(data_dir, key);
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let mut line = redact_sensitive_value(value.clone()).to_string();
-    line.push('\n');
-    use tokio::io::AsyncWriteExt;
-    if let Ok(mut file) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-    {
-        let _ = file.write_all(line.as_bytes()).await;
-    }
-}
-
-async fn read_recent_session_events(
-    data_dir: &Path,
-    key: &SessionKey,
-    limit: usize,
-) -> Result<Vec<Value>> {
-    let path = session_event_log_path(data_dir, key);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = tokio::fs::read_to_string(path).await?;
-    let mut events = VecDeque::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(line)?;
-        if events.len() == limit {
-            events.pop_front();
-        }
-        events.push_back(value);
-    }
-    Ok(events.into_iter().collect())
-}
-
-fn session_event_log_path(data_dir: &Path, key: &SessionKey) -> PathBuf {
-    data_dir
-        .join("events")
-        .join(safe_path_component(&key.node_id))
-        .join(safe_path_component(&key.project_id))
-        .join(format!("{}.jsonl", safe_path_component(&key.session_id)))
-}
-
-fn safe_path_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-impl HubStore {
-    async fn load(data_dir: &Path) -> Result<Self> {
-        let path = data_dir.join("hub-state.json");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("read {}", path.display()))?;
-        Ok(serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?)
-    }
-
-    async fn save(&self, data_dir: &Path) -> Result<()> {
-        tokio::fs::create_dir_all(data_dir).await?;
-        let path = data_dir.join("hub-state.json");
-        let data = serde_json::to_vec_pretty(self)?;
-        tokio::fs::write(&path, data)
-            .await
-            .with_context(|| format!("write {}", path.display()))
-    }
-
-    fn create_user(&mut self, username: String) -> (UserRecord, String) {
-        let user_id = format!("user_{}", Uuid::new_v4().simple());
-        let token = new_secret("ppu");
-        let now = now_secs();
-        let user = UserRecord {
-            user_id: user_id.clone(),
-            username,
-            token_hash: hash_secret(&token),
-            auth_identities: Vec::new(),
-            client_preferences: serde_json::Map::new(),
-            recently_used: serde_json::Map::new(),
-            provider_preferences: serde_json::Map::new(),
-            default_session_settings: serde_json::Map::new(),
-            audit_metadata: serde_json::Map::new(),
-            created_at: now,
-            updated_at: now,
-        };
-        self.users.insert(user_id, user.clone());
-        (user, token)
-    }
-
-    fn grant_node_access(&mut self, user_id: &str, node_id: &str) -> Result<()> {
-        self.users.get(user_id).context("user not found")?;
-        self.nodes.get(node_id).context("node not found")?;
-        if !self.user_can_access_node(user_id, node_id) {
-            self.node_access_grants.push(NodeAccessGrant {
-                user_id: user_id.to_string(),
-                node_id: node_id.to_string(),
-                created_at: now_secs(),
-            });
-        }
-        Ok(())
-    }
-
-    fn user_can_access_node(&self, user_id: &str, node_id: &str) -> bool {
-        let node_accessible = self.nodes.get(node_id).is_some_and(|node| {
-            node.status != NodeStatus::Revoked && node.status != NodeStatus::Disabled
-        });
-        node_accessible
-            && self
-                .node_access_grants
-                .iter()
-                .any(|grant| grant.user_id == user_id && grant.node_id == node_id)
-    }
-
-    fn add_provider_api_key(
-        &mut self,
-        user_id: String,
-        provider_id: String,
-        display_name: String,
-        api_key: String,
-    ) -> Result<ProviderAccountRecord> {
-        self.users.get(&user_id).context("user not found")?;
-        let now = now_secs();
-        let account = ProviderAccountRecord {
-            provider_account_id: format!("provacct_{}", Uuid::new_v4().simple()),
-            user_id,
-            provider_id,
-            display_name,
-            auth_type: "api_key".to_string(),
-            encrypted_secret: encrypt_secret(&api_key)?,
-            available_models: Vec::new(),
-            default_model: None,
-            created_at: now,
-            updated_at: now,
-            revoked_at: None,
-        };
-        self.provider_accounts
-            .insert(account.provider_account_id.clone(), account.clone());
-        Ok(account)
-    }
-
-    fn revoke_provider_account(&mut self, provider_account_id: &str) -> Result<()> {
-        let account = self
-            .provider_accounts
-            .get_mut(provider_account_id)
-            .context("provider account not found")?;
-        account.revoked_at = Some(now_secs());
-        account.updated_at = now_secs();
-        Ok(())
-    }
-
-    fn provider_account_secret(
-        &self,
-        user_id: &str,
-        provider_account_id: &str,
-    ) -> Result<(String, String)> {
-        let account = self
-            .provider_accounts
-            .get(provider_account_id)
-            .context("provider account not found")?;
-        if account.user_id != user_id {
-            return Err(anyhow!("provider account does not belong to user"));
-        }
-        if account.revoked_at.is_some() {
-            return Err(anyhow!("provider account is revoked"));
-        }
-        Ok((
-            account.provider_id.clone(),
-            decrypt_secret(&account.encrypted_secret)?,
-        ))
-    }
-
-    fn create_node(&mut self, name: String) -> (NodeRecord, String) {
-        let node_id = format!("node_{}", Uuid::new_v4().simple());
-        let setup_key = new_secret("ppn_setup");
-        let now = now_secs();
-        let node = NodeRecord {
-            node_id: node_id.clone(),
-            name,
-            hostname: None,
-            version: None,
-            status: NodeStatus::Offline,
-            setup_key_hash: Some(hash_secret(&setup_key)),
-            setup_key_expires_at: Some(now + SETUP_KEY_TTL_SECS),
-            token_hash: None,
-            public_key: None,
-            capabilities: vec!["ed25519-challenge-auth".into()],
-            projects: vec![],
-            sessions: vec![],
-            inventory_revision: None,
-            created_at: now,
-            enrolled_at: None,
-            last_seen_at: None,
-            revoked_at: None,
-        };
-        self.nodes.insert(node_id, node.clone());
-        (node, setup_key)
-    }
-
-    fn issue_setup_key(&mut self, node_id: &str) -> Result<String> {
-        let node = self.nodes.get_mut(node_id).context("node not found")?;
-        if node.status == NodeStatus::Revoked {
-            return Err(anyhow!("node is revoked"));
-        }
-        let setup_key = new_secret("ppn_setup");
-        node.setup_key_hash = Some(hash_secret(&setup_key));
-        node.setup_key_expires_at = Some(now_secs() + SETUP_KEY_TTL_SECS);
-        Ok(setup_key)
-    }
-
-    fn revoke_node(&mut self, node_id: &str) -> Result<()> {
-        let node = self.nodes.get_mut(node_id).context("node not found")?;
-        node.status = NodeStatus::Revoked;
-        node.revoked_at = Some(now_secs());
-        node.setup_key_hash = None;
-        node.setup_key_expires_at = None;
-        node.token_hash = None;
-        node.public_key = None;
-        Ok(())
-    }
-
-    fn disable_node(&mut self, node_id: &str) -> Result<()> {
-        let node = self.nodes.get_mut(node_id).context("node not found")?;
-        if node.status != NodeStatus::Revoked {
-            node.status = NodeStatus::Disabled;
-        }
-        Ok(())
-    }
-
-    fn rotate_node_key(&mut self, node_id: &str) -> Result<String> {
-        let setup_key = self.issue_setup_key(node_id)?;
-        let node = self.nodes.get_mut(node_id).context("node not found")?;
-        node.public_key = None;
-        node.token_hash = None;
-        if node.status != NodeStatus::Revoked {
-            node.status = NodeStatus::Offline;
-        }
-        Ok(setup_key)
-    }
-
-    fn enroll_node(&mut self, body: EnrollRequest, hub_url: &str) -> Result<EnrollResponse> {
-        if let Some(kind) = &body.kind {
-            if kind != "node.enroll" {
-                return Err(anyhow!("expected type node.enroll"));
-            }
-        }
-        let now = now_secs();
-        let node = self
-            .nodes
-            .values_mut()
-            .find(|node| {
-                node.setup_key_hash.as_deref() == Some(hash_secret(&body.setup_key).as_str())
-                    && node
-                        .setup_key_expires_at
-                        .is_some_and(|expires| expires >= now)
-            })
-            .context("invalid or expired setup key")?;
-        if node.status == NodeStatus::Revoked || node.status == NodeStatus::Disabled {
-            return Err(anyhow!("node is not enrollable"));
-        }
-        let public_key = body.public_key.context("public_key is required")?;
-        decode_base64_array::<32>(&public_key)
-            .context("public_key must be base64 ed25519 public key bytes")?;
-        node.hostname = body.hostname;
-        node.version = body.version;
-        node.public_key = Some(public_key);
-        node.token_hash = None;
-        node.setup_key_hash = None;
-        node.setup_key_expires_at = None;
-        node.enrolled_at = Some(now);
-        node.last_seen_at = Some(now);
-        Ok(EnrollResponse {
-            kind: "node.enrolled",
-            node_id: node.node_id.clone(),
-            hub_url: hub_url.to_string(),
-        })
-    }
-}
-
-fn default_hub_data_dir() -> PathBuf {
-    std::env::var_os("PUMPKINPI_HUB_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pumpkinpi-hub")))
-        .unwrap_or_else(|| PathBuf::from(".pumpkinpi-hub"))
-}
-
-fn new_secret(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4().simple())
-}
-
-fn new_nonce() -> String {
-    let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    BASE64.encode(bytes)
-}
-
-fn master_cipher() -> Result<Aes256Gcm> {
-    let encoded = std::env::var("PUMPKINPI_MASTER_KEY").context(
-        "PUMPKINPI_MASTER_KEY must be set to base64 32-byte key for provider secret encryption",
-    )?;
-    let key = decode_base64_array::<32>(&encoded)?;
-    Ok(Aes256Gcm::new_from_slice(&key).expect("32-byte AES key"))
-}
-
-fn encrypt_secret(secret: &str) -> Result<EncryptedSecret> {
-    let cipher = master_cipher()?;
-    let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
-        .map_err(|_| anyhow!("provider secret encryption failed"))?;
-    Ok(EncryptedSecret {
-        nonce: BASE64.encode(nonce),
-        ciphertext: BASE64.encode(ciphertext),
-    })
-}
-
-fn decrypt_secret(secret: &EncryptedSecret) -> Result<String> {
-    let cipher = master_cipher()?;
-    let nonce = decode_base64_array::<12>(&secret.nonce)?;
-    let ciphertext = BASE64
-        .decode(&secret.ciphertext)
-        .context("invalid ciphertext base64")?;
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|_| anyhow!("provider secret decryption failed"))?;
-    String::from_utf8(plaintext).context("provider secret is not utf-8")
-}
-
-fn decode_base64_array<const N: usize>(value: &str) -> Result<[u8; N]> {
-    let bytes = BASE64.decode(value).context("invalid base64")?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| anyhow!("expected {N} bytes, got {}", bytes.len()))
-}
-
-fn hash_secret(secret: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

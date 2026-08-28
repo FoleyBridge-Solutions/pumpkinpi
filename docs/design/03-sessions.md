@@ -1,61 +1,84 @@
-# Sessions
+# Internal Sessions and Runs
 
-## Multiple Projects and Sessions
+Sessions and Runs are PumpkinPi execution machinery. They are documented because they are required for implementation, reliability, safety, and diagnostics; they are not the primary product object.
 
-A node can host many projects:
+The user normally interacts only with a Project's Intent Chat. PumpkinPi creates, resumes, coordinates, and retires internal Sessions to maintain the Source of Intent and make Project reality conform to it.
+
+## Multiple Projects and Internal Sessions
+
+A Spoke can host many Projects, and each Project can have concurrent internal work:
 
 ```text
-Node
+Spoke
   ├─ Project: /home/me/app
-  │   ├─ Session: fix-tests
-  │   └─ Session: refactor-auth
-  ├─ Project: /home/me/website
-  │   └─ Session: landing-page
-  └─ Project: /home/me/dotfiles
-      └─ Session: config-work
+  │   ├─ Intent Chat / intent-maintenance Session
+  │   ├─ implementation Run
+  │   └─ validation Run
+  └─ Project: /home/me/website
+      ├─ Intent Chat / intent-maintenance Session
+      └─ inspection Run
 ```
 
-Multiple sessions can run in parallel. Each active session has its own Pi RPC process.
+Each active Session has its own Pi RPC process. Commands are serialized per Session, not globally, while independent Sessions may run in parallel.
 
-Commands are serialized per session, not globally:
+Client disconnect must not kill work by default. Multiple Clients may observe the same Project/Intent Chat, but they should not need to attach manually to each internal Session.
 
-```text
-session A queue → pi process A
-session B queue → pi process B
-session C queue → pi process C
-```
+## Session Purpose and Intent Binding
 
-Multiple clients may attach to the same session at the same time.
+Every internal Session/Run must have a declared purpose:
 
-Client disconnect must not kill the session by default.
+- `intent`: interpret conversation, update Source of Intent, and project it back to users
+- `inspection`: gather context/evidence without primarily changing Project state
+- `implementation`: change Project reality toward a Source of Intent revision
+- `validation`: test claims and behavior produced by implementation
+- `review`: independently inspect complete Project reality against a complete Source of Intent revision, returning every finding or approval with no findings
+- `recovery`: diagnose or repair failed internal work
+
+Implementation and validation Runs execute in a per-operation isolated Git worktree, never directly in the primary Project checkout. Each successful implementation iteration creates a durable checkpoint commit. Independent review examines that checkpoint; zero-finding approval promotes it to the primary checkout with an automatic fast-forward transaction. Primary-checkout drift or a non-fast-forward blocks promotion rather than overwriting work. No per-iteration permission gate is required.
+
+Implementation, validation, and review Runs record the Source of Intent revision they serve. If intent changes materially while a Run is active, PumpkinPi must decide whether to continue, cancel, or mark its output as based on stale intent. It must not silently present stale work as satisfying current intent.
+
+After each implementation/validation increment, an independent review Run evaluates the whole Project against the whole current Source of Intent. Every finding feeds another bounded implementation iteration. Project realization is satisfied only when review returns no findings and no required scope remains unreviewed. Iteration or resource limits pause work; they never imply success.
+
+## Reporting Back to Intent Chat
+
+Raw Session output remains internal detail by default. PumpkinPi should promote information to Intent Chat when it is:
+
+- a clarification or decision needed from the user
+- a meaningful progress/status transition
+- a consequential safety prompt
+- an outcome and its evidence
+- a divergence between intent and reality
+- a failure requiring user-visible recovery
 
 ## Pi Process Execution Identity
 
-The Node daemon may run as root, but each Pi subprocess has an explicit `run_as_user` / `run_as_root` setting.
+The Spoke daemon may run as root, but each Pi subprocess has explicit `run_as_user` / `run_as_root` settings.
 
 Default behavior:
 
-- project sessions run as the project owner or configured project `run_as_user`
-- root Pi sessions are denied unless `allow_root_sessions` is true for the project and the requesting user is authorized for root sessions on that node
-- the effective user is recorded in session metadata and audit logs
-- provider credentials delivered to the Pi process are accessible to that effective user and to the privileged Node daemon
+- Project Sessions run as the Project owner or configured `run_as_user`
+- root Sessions are denied unless `allow_root_sessions` is true, the operation explicitly requires root, and local Spoke policy allows it
+- effective user is recorded in Session metadata, evidence, and audit logs
+- provider credentials delivered to Pi are accessible to that effective user and privileged Spoke daemon
 
 ## Process Death and Recovery
 
-If a Pi subprocess exits unexpectedly, the Node must:
+If a Pi subprocess exits unexpectedly, the Spoke must:
 
-1. mark the PumpkinPi session `crashed`
-2. record exit status/signal, stderr tail, timestamp, and last known Pi session metadata
-3. broadcast `session.crashed` to subscribers
-4. reject ordinary `session.send` commands while crashed, except lifecycle commands such as `session.restart`, `session.stop`, `session.delete`, and diagnostic queries
+1. mark the internal Session `crashed`
+2. record exit status/signal, stderr tail, timestamp, purpose, affected Source of Intent revision, and last known Pi metadata
+3. broadcast normalized crash state to orchestration/subscribers
+4. update Intent Chat with a concise explanation when the crash affects visible work
+5. reject ordinary commands while crashed except lifecycle/diagnostic commands
 
-Restart behavior is explicit, not implicit:
+Restart behavior is explicit and durable:
 
-- `session.restart` starts a new Pi RPC process for the same PumpkinPi `session_id`
-- if `pi_session_file` still exists, the Node should launch/switch Pi to that file when supported and then refresh `get_state` / `get_entries`
-- if the Pi session file is missing, the session becomes `missing` and requires either restore, clone/new-session wrapper, or delete
-- the PumpkinPi `session_id` remains stable across restart; Pi's internal `sessionId`, `sessionFile`, `leafId`, and `sessionName` must be refreshed after restart
-- auto-restart may be added later as a per-session policy, but the default should be no auto-restart to avoid repeating destructive tool actions
+- uncommitted isolated changes are discarded to the last checkpoint
+- persisted realization phase, iteration, findings, operation, and workspace binding are recovered
+- active realization is queued and resumes automatically after Spoke authentication
+- restart creates a new Pi process while preserving PumpkinPi operation identity
+- already checkpointed changes are inspected from current isolated reality rather than blindly repeated in primary
+- missing or corrupt worktrees block with retained diagnostics instead of recreating uncertain destructive state
 
-Late subscribers to a restarted session should receive a metadata snapshot plus durable entries from Pi where possible, not only the in-memory pre-crash event ring buffer.
-
+Late observers should receive Project/Intent Chat state and promoted outcomes first. Detailed diagnostics may additionally replay durable internal Session entries.

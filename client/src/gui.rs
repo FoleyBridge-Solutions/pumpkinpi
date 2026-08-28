@@ -1,448 +1,1576 @@
 use std::{
-    sync::mpsc::{self, TryRecvError},
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    net::{SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow};
-use eframe::egui;
+use anyhow::{Context, Result, anyhow};
+use dioxus::prelude::*;
 use futures_util::{SinkExt, StreamExt};
-use pumpkinpi_protocol::PROTOCOL_VERSION;
-use serde_json::{Value, json};
+use pumpkinpi_protocol::*;
+use serde_json::Value;
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use uuid::Uuid;
 
 use crate::client_config;
 
-enum WsCommand {
-    ListNodes,
-    ListProjects {
-        node_id: String,
-    },
-    ListSessions {
-        node_id: String,
-        project_id: String,
-    },
-    Subscribe {
-        node_id: String,
-        project_id: String,
-        session_id: String,
-    },
-    SendPrompt {
-        node_id: String,
-        project_id: String,
-        session_id: String,
-        message: String,
-    },
+const STYLES: &str = include_str!("../assets/styles.css");
+
+#[derive(Debug, Clone)]
+enum ConnectionKind {
+    Disconnected,
+    Connecting,
+    Authenticating,
+    Connected,
+    Reconnecting,
+    Degraded,
 }
 
-enum WsEvent {
-    Connected,
-    Incoming(Value),
-    Error(String),
-    Disconnected,
+impl ConnectionKind {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::Authenticating => "authenticating",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionView {
+    kind: ConnectionKind,
+    label: String,
+    attempt: u32,
+    reason: Option<String>,
+}
+
+impl ConnectionView {
+    fn disconnected() -> Self {
+        Self {
+            kind: ConnectionKind::Disconnected,
+            label: "Disconnected".into(),
+            attempt: 0,
+            reason: None,
+        }
+    }
+
+    fn simple(kind: ConnectionKind, label: &str) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            attempt: 0,
+            reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingMessage {
+    spoke_id: SpokeId,
+    project_id: ProjectId,
+    local_id: String,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct InteractionView {
+    spoke_id: SpokeId,
+    project_id: ProjectId,
+    operation_id: OperationId,
+    request_id: String,
+    method: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct UiState {
+    connection: ConnectionView,
+    configured: bool,
+    hub_url: String,
+    spokes: Vec<SpokeRecord>,
+    projects: Vec<ProjectRecord>,
+    selected: Option<ProjectKey>,
+    selected_snapshot: Option<ProjectSnapshot>,
+    pending_messages: Vec<PendingMessage>,
+    interactions: Vec<InteractionView>,
+    path_suggestions: BTreeMap<SpokeId, Vec<String>>,
+    diagnostics: Vec<String>,
+}
+
+struct AppStore {
+    connection: ConnectionView,
+    configured: bool,
+    hub_url: String,
+    spokes: BTreeMap<SpokeId, SpokeRecord>,
+    projects: BTreeMap<ProjectKey, ProjectRecord>,
+    snapshots: BTreeMap<ProjectKey, ProjectSnapshot>,
+    selected: Option<ProjectKey>,
+    pending_messages: Vec<PendingMessage>,
+    interactions: BTreeMap<(OperationId, String), InteractionView>,
+    path_suggestions: BTreeMap<SpokeId, Vec<String>>,
+    diagnostics: Vec<String>,
+    pending_local_project: Option<(String, Option<String>)>,
+}
+
+impl Default for AppStore {
+    fn default() -> Self {
+        let config = client_config::load().unwrap_or_default();
+        Self {
+            connection: ConnectionView::disconnected(),
+            configured: client_config::resolve_token().ok().flatten().is_some(),
+            hub_url: config.hub,
+            spokes: BTreeMap::new(),
+            projects: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
+            selected: None,
+            pending_messages: Vec::new(),
+            interactions: BTreeMap::new(),
+            path_suggestions: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            pending_local_project: None,
+        }
+    }
+}
+
+impl AppStore {
+    fn view(&self) -> UiState {
+        UiState {
+            connection: self.connection.clone(),
+            configured: self.configured,
+            hub_url: self.hub_url.clone(),
+            spokes: self.spokes.values().cloned().collect(),
+            projects: self.projects.values().cloned().collect(),
+            selected: self.selected.clone(),
+            selected_snapshot: self
+                .selected
+                .as_ref()
+                .and_then(|key| self.snapshots.get(key).cloned()),
+            pending_messages: self.pending_messages.clone(),
+            interactions: self.interactions.values().cloned().collect(),
+            path_suggestions: self.path_suggestions.clone(),
+            diagnostics: self.diagnostics.iter().rev().take(100).cloned().collect(),
+        }
+    }
+
+    fn diagnostic(&mut self, message: impl Into<String>) {
+        self.diagnostics.push(message.into());
+        if self.diagnostics.len() > 500 {
+            self.diagnostics.drain(..100);
+        }
+    }
+}
+
+enum ActorCommand {
+    Request(ClientCommand),
+    Stop,
+}
+
+#[derive(Clone)]
+struct GuiRuntime {
+    store: Arc<Mutex<AppStore>>,
+    actor: Arc<Mutex<Option<mpsc::Sender<ActorCommand>>>>,
+    updates: watch::Sender<UiState>,
+}
+
+impl Default for GuiRuntime {
+    fn default() -> Self {
+        let store = AppStore::default();
+        let (updates, _) = watch::channel(store.view());
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            actor: Arc::new(Mutex::new(None)),
+            updates,
+        }
+    }
+}
+
+impl GuiRuntime {
+    fn view(&self) -> UiState {
+        self.store.lock().expect("store lock poisoned").view()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<UiState> {
+        self.updates.subscribe()
+    }
+
+    fn emit(&self) {
+        self.updates.send_replace(self.view());
+    }
+
+    fn diagnostic(&self, message: impl Into<String>) {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .diagnostic(message);
+        self.emit();
+    }
+
+    fn set_connection(&self, connection: ConnectionView) {
+        self.store.lock().expect("store lock poisoned").connection = connection;
+        self.emit();
+    }
+
+    fn request(&self, command: ClientCommand) -> std::result::Result<(), String> {
+        self.actor
+            .lock()
+            .map_err(|_| "protocol actor lock poisoned".to_string())?
+            .as_ref()
+            .ok_or_else(|| "not connected".to_string())?
+            .send(ActorCommand::Request(command))
+            .map_err(|_| "protocol actor stopped".to_string())
+    }
+
+    fn dispatch(&self, command: ClientCommand) {
+        if let Err(error) = self.request(command) {
+            self.diagnostic(error);
+        }
+    }
+
+    fn connect(&self) {
+        if let Some(actor) = self.actor.lock().expect("actor lock poisoned").take() {
+            let _ = actor.send(ActorCommand::Stop);
+        }
+        let (tx, rx) = mpsc::channel();
+        *self.actor.lock().expect("actor lock poisoned") = Some(tx);
+        let runtime = self.clone();
+        thread::spawn(move || match tokio::runtime::Runtime::new() {
+            Ok(tokio) => tokio.block_on(protocol_actor(runtime, rx)),
+            Err(error) => runtime.set_connection(ConnectionView {
+                kind: ConnectionKind::Degraded,
+                label: "Runtime failed".into(),
+                attempt: 0,
+                reason: Some(error.to_string()),
+            }),
+        });
+    }
+
+    fn login(&self, hub: String, token: String) {
+        match client_config::login(hub.clone(), token) {
+            Ok(_) => {
+                let mut store = self.store.lock().expect("store lock poisoned");
+                store.configured = true;
+                store.hub_url = hub;
+                drop(store);
+                self.emit();
+                self.connect();
+            }
+            Err(error) => self.diagnostic(format!("Login failed: {error}")),
+        }
+    }
+
+    fn open_local_project(&self, path: PathBuf) {
+        let cwd = path.to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .pending_local_project = Some((cwd, name));
+        self.set_connection(ConnectionView::simple(
+            ConnectionKind::Connecting,
+            "Starting local workspace",
+        ));
+
+        let runtime = self.clone();
+        thread::spawn(move || match bootstrap_local_services() {
+            Ok((hub, token)) => {
+                if let Err(error) = client_config::login(hub.clone(), token) {
+                    runtime.diagnostic(format!("Could not save local connection: {error}"));
+                    return;
+                }
+                {
+                    let mut store = runtime.store.lock().expect("store lock poisoned");
+                    store.configured = true;
+                    store.hub_url = hub;
+                    store.diagnostic("Local Hub and Spoke are ready");
+                }
+                runtime.emit();
+                runtime.connect();
+            }
+            Err(error) => runtime.set_connection(ConnectionView {
+                kind: ConnectionKind::Degraded,
+                label: "Local setup failed".into(),
+                attempt: 0,
+                reason: Some(error.to_string()),
+            }),
+        });
+    }
+
+    fn refresh(&self) {
+        self.dispatch(ClientCommand::SpokeList);
+        self.dispatch(ClientCommand::ProjectList { spoke_id: None });
+    }
+
+    fn select_project(&self, key: ProjectKey) {
+        let cursor = {
+            let mut store = self.store.lock().expect("store lock poisoned");
+            store.selected = Some(key.clone());
+            store
+                .snapshots
+                .get(&key)
+                .and_then(|snapshot| snapshot.timeline.last().map(|item| item.cursor))
+        };
+        self.emit();
+        self.dispatch(ClientCommand::IntentSubscribe {
+            spoke_id: key.spoke_id,
+            project_id: key.project_id,
+            cursor,
+        });
+    }
+
+    fn initialize_project(&self, spoke_id: SpokeId, cwd: String, name: String) {
+        if cwd.trim().is_empty() {
+            self.diagnostic("A project path is required");
+            return;
+        }
+        self.dispatch(ClientCommand::ProjectInitialize {
+            spoke_id,
+            cwd,
+            name: (!name.trim().is_empty()).then_some(name),
+        });
+    }
+
+    fn send_intent(&self, key: ProjectKey, message: String) {
+        if message.trim().is_empty() {
+            return;
+        }
+        let revision = {
+            let mut store = self.store.lock().expect("store lock poisoned");
+            let revision = store
+                .snapshots
+                .get(&key)
+                .map(|snapshot| snapshot.source.revision);
+            store.pending_messages.push(PendingMessage {
+                spoke_id: key.spoke_id.clone(),
+                project_id: key.project_id.clone(),
+                local_id: Uuid::new_v4().to_string(),
+                message: message.clone(),
+            });
+            revision
+        };
+        self.emit();
+        self.dispatch(ClientCommand::IntentSend {
+            spoke_id: key.spoke_id,
+            project_id: key.project_id,
+            message,
+            expected_revision: revision,
+        });
+    }
+
+    fn cancel(&self, operation: &OperationRecord) {
+        self.dispatch(ClientCommand::IntentCancel {
+            spoke_id: operation.spoke_id.clone(),
+            project_id: operation.project_id.clone(),
+            operation_id: operation.operation_id.clone(),
+        });
+    }
+
+    fn answer(&self, interaction: &InteractionView, response: Value) {
+        self.dispatch(ClientCommand::IntentAnswer {
+            spoke_id: interaction.spoke_id.clone(),
+            project_id: interaction.project_id.clone(),
+            operation_id: interaction.operation_id.clone(),
+            request_id: interaction.request_id.clone(),
+            response,
+        });
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .interactions
+            .remove(&(
+                interaction.operation_id.clone(),
+                interaction.request_id.clone(),
+            ));
+        self.emit();
+    }
+
+    fn projection(&self, key: &ProjectKey) {
+        self.dispatch(ClientCommand::IntentGetProjection {
+            spoke_id: key.spoke_id.clone(),
+            project_id: key.project_id.clone(),
+        });
+    }
+
+    fn apply(&self, event: ClientEvent) {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        let mut follow_up = None;
+        match event.payload {
+            ClientPayload::Authenticated => {}
+            ClientPayload::SpokeList { spokes } => {
+                store.spokes = spokes
+                    .into_iter()
+                    .map(|spoke| (spoke.spoke_id.clone(), spoke))
+                    .collect();
+                if let Some((cwd, name)) = store.pending_local_project.clone()
+                    && let Some(spoke) = store
+                        .spokes
+                        .values()
+                        .find(|spoke| spoke.status == SpokeStatus::Online)
+                {
+                    follow_up = Some(ClientCommand::ProjectInitialize {
+                        spoke_id: spoke.spoke_id.clone(),
+                        cwd,
+                        name,
+                    });
+                    store.pending_local_project = None;
+                }
+            }
+            ClientPayload::ProjectList { projects } => {
+                store.projects.clear();
+                for project in projects {
+                    store.projects.insert(project_key(&project), project);
+                }
+            }
+            ClientPayload::ProjectSnapshot { snapshot } => {
+                let snapshot = *snapshot;
+                let key = project_key(&snapshot.project);
+                store.projects.insert(key.clone(), snapshot.project.clone());
+                store
+                    .snapshots
+                    .entry(key.clone())
+                    .and_modify(|old| merge_snapshot(old, &snapshot))
+                    .or_insert(snapshot);
+                store.selected = Some(key.clone());
+                store.pending_messages.retain(|pending| {
+                    pending.spoke_id != key.spoke_id || pending.project_id != key.project_id
+                });
+            }
+            ClientPayload::Timeline { item } => {
+                let key = ProjectKey {
+                    spoke_id: item.spoke_id.clone(),
+                    project_id: item.project_id.clone(),
+                };
+                if let Some(snapshot) = store.snapshots.get_mut(&key)
+                    && !snapshot
+                        .timeline
+                        .iter()
+                        .any(|existing| existing.timeline_item_id == item.timeline_item_id)
+                {
+                    snapshot.timeline.push(item);
+                    snapshot.timeline.sort_by_key(|entry| entry.cursor);
+                }
+                store.pending_messages.retain(|pending| {
+                    pending.spoke_id != key.spoke_id || pending.project_id != key.project_id
+                });
+            }
+            ClientPayload::Accepted { operation } | ClientPayload::Operation { operation } => {
+                let key = ProjectKey {
+                    spoke_id: operation.spoke_id.clone(),
+                    project_id: operation.project_id.clone(),
+                };
+                if let Some(snapshot) = store.snapshots.get_mut(&key) {
+                    if let Some(existing) = snapshot
+                        .operations
+                        .iter_mut()
+                        .find(|existing| existing.operation_id == operation.operation_id)
+                    {
+                        *existing = operation;
+                    } else {
+                        snapshot.operations.push(operation);
+                    }
+                }
+            }
+            ClientPayload::Interaction {
+                spoke_id,
+                project_id,
+                operation_id,
+                request_id,
+                method,
+                payload,
+            } => {
+                let interaction = InteractionView {
+                    spoke_id,
+                    project_id,
+                    operation_id: operation_id.clone(),
+                    request_id: request_id.clone(),
+                    method,
+                    payload,
+                };
+                store
+                    .interactions
+                    .insert((operation_id, request_id), interaction);
+            }
+            ClientPayload::ProjectUpdated { project } => {
+                let key = project_key(&project);
+                if project.status == ProjectStatus::Removed {
+                    store.projects.remove(&key);
+                    store.snapshots.remove(&key);
+                    if store.selected.as_ref() == Some(&key) {
+                        store.selected = None;
+                    }
+                } else {
+                    store.projects.insert(key, project);
+                }
+            }
+            ClientPayload::SpokeUpdated { spoke } => {
+                store.spokes.insert(spoke.spoke_id.clone(), spoke);
+            }
+            ClientPayload::ProjectPathList {
+                spoke_id,
+                directories,
+                ..
+            } => {
+                store.path_suggestions.insert(spoke_id, directories);
+            }
+            ClientPayload::Projection {
+                revision, content, ..
+            } => store.diagnostic(format!("Intent projection r{revision}: {content}")),
+            ClientPayload::ReplayGap {
+                requested,
+                available,
+                ..
+            } => store.diagnostic(format!(
+                "Timeline replay gap: requested {requested}, earliest available {available}"
+            )),
+            ClientPayload::Error { code, message } => {
+                store.diagnostic(format!("{code}: {message}"));
+                store.connection = ConnectionView {
+                    kind: ConnectionKind::Degraded,
+                    label: "Attention required".into(),
+                    attempt: 0,
+                    reason: Some(message),
+                };
+            }
+            ClientPayload::ProviderList { .. } | ClientPayload::HubStatus { .. } => {}
+        }
+        drop(store);
+        self.emit();
+        if let Some(command) = follow_up {
+            self.dispatch(command);
+        }
+    }
+}
+
+const LOCAL_PORT: u16 = 43_123;
+
+fn choose_local_project(runtime: GuiRuntime) {
+    if let Some(path) = rfd::FileDialog::new()
+        .set_title("Open local project")
+        .pick_folder()
+    {
+        runtime.open_local_project(path);
+    }
+}
+
+fn local_root() -> Result<PathBuf> {
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(state).join("pumpkinpi/local-v3"));
+    }
+    let home = std::env::var_os("HOME").context("HOME is required for local mode")?;
+    Ok(PathBuf::from(home).join(".local/state/pumpkinpi/local-v3"))
+}
+
+fn sibling_binary(name: &str) -> Result<PathBuf> {
+    let mut path = std::env::current_exe().context("could not locate PumpkinPi binaries")?;
+    path.set_file_name(name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(anyhow!(
+            "{name} was not found beside {}",
+            std::env::current_exe()?.display()
+        ))
+    }
+}
+
+fn run_output(binary: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(binary)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {}", binary.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn process_alive(pid_file: &Path) -> bool {
+    fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+}
+
+fn local_port_open() -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], LOCAL_PORT));
+    TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok()
+}
+
+fn wait_for_local_hub() -> Result<()> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(8) {
+        if local_port_open() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(anyhow!("local Hub did not start within 8 seconds"))
+}
+
+fn spawn_service(binary: &Path, args: &[&str], log: &Path, pid_file: &Path) -> Result<()> {
+    let stdout = fs::File::create(log)?;
+    let stderr = stdout.try_clone()?;
+    let child = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("failed to start {}", binary.display()))?;
+    fs::write(pid_file, child.id().to_string())?;
+    Ok(())
+}
+
+fn write_local_token(path: &Path, token: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+    Ok(())
+}
+
+fn bootstrap_local_services() -> Result<(String, String)> {
+    let root = local_root()?;
+    let hub_data = root.join("hub");
+    let spoke_data = root.join("spoke");
+    let logs = root.join("logs");
+    fs::create_dir_all(&hub_data)?;
+    fs::create_dir_all(&spoke_data)?;
+    fs::create_dir_all(&logs)?;
+
+    let hub_binary = sibling_binary("pumpkinpi-hub")?;
+    let spoke_binary = sibling_binary("pumpkinpi-spoke")?;
+    let hub_data_text = hub_data.to_string_lossy().into_owned();
+    let spoke_data_text = spoke_data.to_string_lossy().into_owned();
+    let listen = format!("127.0.0.1:{LOCAL_PORT}");
+    let http_url = format!("http://{listen}");
+    let websocket_url = format!("ws://{listen}/ws/client");
+    let token_file = root.join("owner.token");
+    let spoke_config = spoke_data.join("config.json");
+
+    let token = if token_file.is_file() {
+        fs::read_to_string(&token_file)?.trim().to_owned()
+    } else {
+        if local_port_open() {
+            return Err(anyhow!(
+                "port {LOCAL_PORT} is already in use and no local credentials exist"
+            ));
+        }
+        let token = run_output(&hub_binary, &["--data-dir", &hub_data_text, "owner-token"])?;
+        write_local_token(&token_file, &token)?;
+        token
+    };
+
+    let mut setup_key = None;
+    if !spoke_config.is_file() {
+        if local_port_open() {
+            return Err(anyhow!(
+                "local Hub is already running but local Spoke enrollment is incomplete"
+            ));
+        }
+        let created = run_output(
+            &hub_binary,
+            &[
+                "--data-dir",
+                &hub_data_text,
+                "spoke",
+                "create",
+                "Local machine",
+            ],
+        )?;
+        setup_key = created.lines().find_map(|line| {
+            line.strip_prefix("setup_key:")
+                .map(|value| value.trim().to_owned())
+        });
+        if setup_key.is_none() {
+            return Err(anyhow!("local Hub did not return a Spoke setup key"));
+        }
+    }
+
+    let hub_pid = root.join("hub.pid");
+    if !local_port_open() {
+        spawn_service(
+            &hub_binary,
+            &[
+                "--data-dir",
+                &hub_data_text,
+                "serve",
+                "--listen",
+                &listen,
+                "--public-url",
+                &http_url,
+            ],
+            &logs.join("hub.log"),
+            &hub_pid,
+        )?;
+        wait_for_local_hub()?;
+    }
+
+    if let Some(setup_key) = setup_key {
+        run_output(
+            &spoke_binary,
+            &[
+                "--data-dir",
+                &spoke_data_text,
+                "enroll",
+                "--hub",
+                &http_url,
+                "--setup-key",
+                &setup_key,
+            ],
+        )?;
+    }
+
+    let spoke_pid = root.join("spoke.pid");
+    if !process_alive(&spoke_pid) {
+        spawn_service(
+            &spoke_binary,
+            &["--data-dir", &spoke_data_text, "serve", "--hub", &http_url],
+            &logs.join("spoke.log"),
+            &spoke_pid,
+        )?;
+    }
+
+    Ok((websocket_url, token))
+}
+
+fn project_key(project: &ProjectRecord) -> ProjectKey {
+    ProjectKey {
+        spoke_id: project.spoke_id.clone(),
+        project_id: project.project_id.clone(),
+    }
+}
+
+fn merge_snapshot(old: &mut ProjectSnapshot, new: &ProjectSnapshot) {
+    old.project = new.project.clone();
+    old.source = new.source.clone();
+    old.chat = new.chat.clone();
+    for item in &new.timeline {
+        if !old
+            .timeline
+            .iter()
+            .any(|existing| existing.timeline_item_id == item.timeline_item_id)
+        {
+            old.timeline.push(item.clone());
+        }
+    }
+    old.timeline.sort_by_key(|item| item.cursor);
+    old.operations = new.operations.clone();
+    old.reviews = new.reviews.clone();
+    old.gap_before = new.gap_before;
+}
+
+fn enum_class(value: &impl std::fmt::Debug) -> String {
+    format!("{value:?}").to_ascii_lowercase()
+}
+
+fn initials(name: &str) -> String {
+    name.split(|ch: char| !ch.is_alphanumeric())
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Context,
+    Activity,
+    Diagnostics,
+}
+
+fn is_active(status: &OperationStatus) -> bool {
+    matches!(
+        status,
+        OperationStatus::Queued
+            | OperationStatus::Accepted
+            | OperationStatus::Running
+            | OperationStatus::Blocked
+    )
+}
+
+fn app() -> Element {
+    let runtime = use_hook(GuiRuntime::default);
+    let mut state = use_signal(|| runtime.view());
+    let mut filter = use_signal(String::new);
+    let composer = use_signal(String::new);
+    let interaction_answer = use_signal(String::new);
+    let mut sidebar_open = use_signal(|| true);
+    let mut inspector_open = use_signal(|| true);
+    let mut inspector_tab = use_signal(|| InspectorTab::Context);
+    let mut show_initialize = use_signal(|| false);
+    let mut show_remote_login = use_signal(|| false);
+    let mut login_hub = use_signal(|| runtime.view().hub_url);
+    let mut login_token = use_signal(String::new);
+    let mut init_spoke = use_signal(String::new);
+    let mut init_cwd = use_signal(String::new);
+    let mut init_name = use_signal(String::new);
+
+    {
+        let runtime = runtime.clone();
+        use_future(move || {
+            let mut receiver = runtime.subscribe();
+            async move {
+                while receiver.changed().await.is_ok() {
+                    let next = receiver.borrow().clone();
+                    state.set(next);
+                }
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        use_effect(move || runtime.connect());
+    }
+
+    let view = state.read().clone();
+    let selected = view.selected.clone();
+    let snapshot = view.selected_snapshot.clone();
+    let shell_class = match (sidebar_open(), inspector_open()) {
+        (true, true) => "app-shell",
+        (false, true) => "app-shell sidebar-closed",
+        (true, false) => "app-shell inspector-closed",
+        (false, false) => "app-shell sidebar-closed inspector-closed",
+    };
+    let connection_class = format!("connection-pill {}", view.connection.kind.class());
+    let connection_title = view.connection.reason.clone().unwrap_or_else(|| {
+        if view.connection.attempt > 0 {
+            format!("Reconnect attempt {}", view.connection.attempt)
+        } else {
+            view.hub_url.clone()
+        }
+    });
+    let filter_text = filter().to_ascii_lowercase();
+    let directory_options = view
+        .path_suggestions
+        .get(&SpokeId(init_spoke()))
+        .cloned()
+        .unwrap_or_default();
+
+    rsx! {
+        style { {STYLES} }
+        div { class: shell_class,
+            header { class: "topbar",
+                div { class: "brand",
+                    div { class: "brand-mark", "P" }
+                    div { strong { "PumpkinPi" } }
+                }
+                button { class: "command-search",
+                    span { "Search projects and intents" }
+                    kbd { "⌘ K" }
+                }
+                div { class: "top-actions",
+                    button {
+                        class: "icon-button",
+                        title: if sidebar_open() { "Collapse projects" } else { "Show projects" },
+                        onclick: move |_| sidebar_open.toggle(),
+                        if sidebar_open() { "◧" } else { "▧" }
+                    }
+                    button {
+                        class: "icon-button",
+                        title: "Refresh",
+                        onclick: { let runtime = runtime.clone(); move |_| runtime.refresh() },
+                        "↻"
+                    }
+                    button {
+                        class: connection_class,
+                        title: connection_title,
+                        onclick: { let runtime = runtime.clone(); move |_| runtime.connect() },
+                        i {}
+                        span { "{view.connection.label}" }
+                    }
+                    button {
+                        class: "icon-button",
+                        title: "Toggle inspector",
+                        onclick: move |_| inspector_open.toggle(),
+                        "◫"
+                    }
+                }
+            }
+
+            aside { class: "sidebar",
+                div { class: "pane-heading",
+                    div { h1 { "Projects" } }
+                    button { class: "small-icon-button", onclick: move |_| show_initialize.set(true), "+" }
+                }
+                div { class: "sidebar-filter",
+                    input {
+                        r#type: "search",
+                        placeholder: "Filter projects…",
+                        value: "{filter}",
+                        oninput: move |event| filter.set(event.value()),
+                    }
+                }
+                div { class: "project-list",
+                    if view.projects.is_empty() {
+                        div { class: "sidebar-empty",
+                            div { class: "empty-orbit", "P" }
+                            h2 { "No projects yet" }
+                            p { "Open a directory on this machine, or initialize one on a remote Spoke." }
+                            button { class: "primary-button", onclick: { let runtime = runtime.clone(); move |_| choose_local_project(runtime.clone()) }, "Open local project" }
+                            button { class: "ghost-button", onclick: move |_| show_initialize.set(true), "Open on a remote Spoke" }
+                        }
+                    }
+                    for spoke in &view.spokes {
+                        div { class: "spoke-group", key: "{spoke.spoke_id}",
+                            div { class: "spoke-heading",
+                                i { class: "presence-dot {enum_class(&spoke.status)}" }
+                                "{spoke.name}"
+                            }
+                            for project in view.projects.iter().filter(|project| {
+                                project.spoke_id == spoke.spoke_id
+                                    && (filter_text.is_empty()
+                                        || project.name.to_ascii_lowercase().contains(&filter_text)
+                                        || project.cwd.to_ascii_lowercase().contains(&filter_text))
+                            }) {
+                                {
+                                    let key = project_key(project);
+                                    let active = selected.as_ref() == Some(&key);
+                                    let class = if active { "project-row active" } else { "project-row" };
+                                    let runtime = runtime.clone();
+                                    let click_key = key.clone();
+                                    rsx! {
+                                        button {
+                                            class,
+                                            key: "{project.project_id}",
+                                            onclick: move |_| runtime.select_project(click_key.clone()),
+                                            div { class: "project-icon", "{initials(&project.name)}" }
+                                            div { class: "project-copy",
+                                                b { "{project.name}" }
+                                                span { "{project.cwd}" }
+                                            }
+                                            i { class: "project-badge {enum_class(&project.initialization_status)}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "spoke-summary", "{view.spokes.len()} Spokes · {view.projects.len()} Projects" }
+            }
+
+            main { class: "workspace",
+                if let Some(snapshot) = &snapshot {
+                    {render_chat(
+                        snapshot,
+                        &view,
+                        &runtime,
+                        composer,
+                        interaction_answer,
+                    )}
+                } else {
+                    section { class: "welcome-view",
+                        div { class: "welcome-visual",
+                            div { class: "visual-core", "P" }
+                            i {} i {} i {}
+                        }
+                        h1 { "What do you want to work on?" }
+                        p { class: "welcome-copy", "Open a project to start or continue its chat." }
+                        button { class: "primary-button", onclick: { let runtime = runtime.clone(); move |_| choose_local_project(runtime.clone()) }, "Open local project" }
+                    }
+                }
+            }
+
+            aside { class: "inspector",
+                div { class: "inspector-tabs",
+                    button {
+                        class: if inspector_tab() == InspectorTab::Context { "active" } else { "" },
+                        onclick: move |_| inspector_tab.set(InspectorTab::Context),
+                        "Context"
+                    }
+                    button {
+                        class: if inspector_tab() == InspectorTab::Activity { "active" } else { "" },
+                        onclick: move |_| inspector_tab.set(InspectorTab::Activity),
+                        "Activity"
+                    }
+                    button {
+                        class: if inspector_tab() == InspectorTab::Diagnostics { "active" } else { "" },
+                        onclick: move |_| inspector_tab.set(InspectorTab::Diagnostics),
+                        "Diagnostics"
+                    }
+                }
+                div { class: "inspector-content", {render_inspector(snapshot.as_ref(), &view, &runtime, inspector_tab())} }
+            }
+        }
+
+        if !view.configured {
+            div { class: "modal-layer",
+                div { class: "modal",
+                    if show_remote_login() {
+                        form { onsubmit: { let runtime = runtime.clone(); move |event| { event.prevent_default(); runtime.login(login_hub(), login_token()); } },
+                            div { class: "modal-mark", "P" }
+                            p { class: "eyebrow", "Remote workspace" }
+                            h1 { "Connect to a Hub" }
+                            p { "Use this for projects on another machine or a shared PumpkinPi installation." }
+                            label { "Hub WebSocket URL"
+                                input { value: "{login_hub}", oninput: move |event| login_hub.set(event.value()) }
+                            }
+                            label { "Owner token"
+                                input { r#type: "password", value: "{login_token}", oninput: move |event| login_token.set(event.value()) }
+                            }
+                            div { class: "modal-actions",
+                                button { class: "secondary-button", r#type: "button", onclick: move |_| show_remote_login.set(false), "Back" }
+                                button { class: "primary-button", r#type: "submit", "Connect" }
+                            }
+                        }
+                    } else {
+                        div { class: "onboarding-content",
+                            div { class: "modal-mark", "P" }
+                            p { class: "eyebrow", "Start locally" }
+                            h1 { "Open a local project" }
+                            p { "Choose a directory. PumpkinPi will start its local services and open the project automatically—no Hub setup or enrollment required." }
+                            button { class: "primary-button local-open-button", onclick: { let runtime = runtime.clone(); move |_| choose_local_project(runtime.clone()) }, "Choose project directory…" }
+                            button { class: "ghost-button", onclick: move |_| show_remote_login.set(true), "Connect to a remote Hub instead" }
+                        }
+                    }
+                }
+            }
+        }
+
+        if show_initialize() {
+            div { class: "modal-layer",
+                div { class: "modal",
+                    form { onsubmit: { let runtime = runtime.clone(); move |event| { event.prevent_default(); runtime.initialize_project(SpokeId(init_spoke()), init_cwd(), init_name()); show_initialize.set(false); } },
+                        p { class: "eyebrow", "New workspace" }
+                        h1 { "Initialize a project" }
+                        p { "Choose a Spoke and an existing directory. PumpkinPi will inspect it before establishing the Source of Intent." }
+                        label { "Spoke"
+                            select { value: "{init_spoke}", oninput: { let runtime = runtime.clone(); move |event| { let spoke = event.value(); init_spoke.set(spoke.clone()); if !spoke.is_empty() { runtime.dispatch(ClientCommand::ProjectPathList { spoke_id: SpokeId(spoke), path: String::new() }); } } },
+                                option { value: "", "Select a Spoke" }
+                                for spoke in view.spokes.iter().filter(|spoke| spoke.status == SpokeStatus::Online) {
+                                    option { value: "{spoke.spoke_id}", "{spoke.name} · {spoke.hostname}" }
+                                }
+                            }
+                        }
+                        label { "Directory"
+                            div { class: "directory-combobox",
+                                input { list: "project-directory-options", placeholder: "/home/me/project", value: "{init_cwd}", oninput: { let runtime = runtime.clone(); move |event| { let path = event.value(); init_cwd.set(path.clone()); let spoke = init_spoke(); if !spoke.is_empty() { runtime.dispatch(ClientCommand::ProjectPathList { spoke_id: SpokeId(spoke), path }); } } } }
+                                datalist { id: "project-directory-options",
+                                    for path in &directory_options { option { value: "{path}" } }
+                                }
+                                select { class: "directory-options", value: "", disabled: init_spoke().is_empty(), oninput: { let runtime = runtime.clone(); move |event| { let path = event.value(); if !path.is_empty() { init_cwd.set(path.clone()); let spoke = init_spoke(); runtime.dispatch(ClientCommand::ProjectPathList { spoke_id: SpokeId(spoke), path }); } } },
+                                    option { value: "",
+                                        if init_spoke().is_empty() { "Select a Spoke to browse…" }
+                                        else if directory_options.is_empty() { "No matching child directories" }
+                                        else { "Choose from {directory_options.len()} directories…" }
+                                    }
+                                    for path in &directory_options { option { value: "{path}", "{path}" } }
+                                }
+                            }
+                        }
+                        label { "Display name " span { "(optional)" }
+                            input { value: "{init_name}", oninput: move |event| init_name.set(event.value()) }
+                        }
+                        div { class: "modal-actions",
+                            button { class: "secondary-button", r#type: "button", onclick: move |_| show_initialize.set(false), "Cancel" }
+                            button { class: "primary-button", r#type: "submit", "Initialize" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_chat(
+    snapshot: &ProjectSnapshot,
+    view: &UiState,
+    runtime: &GuiRuntime,
+    mut composer: Signal<String>,
+    interaction_answer: Signal<String>,
+) -> Element {
+    let key = project_key(&snapshot.project);
+    let initials = initials(&snapshot.project.name);
+    let chat_status = enum_class(&snapshot.chat.status);
+    let realization_status = enum_class(&snapshot.project.realization_status);
+    let status = if realization_status == "inactive" {
+        chat_status
+    } else {
+        realization_status
+    };
+    let status_label = status.replace('_', " ");
+    let active_interactions = view.interactions.iter().filter(|interaction| {
+        interaction.spoke_id == key.spoke_id && interaction.project_id == key.project_id
+    });
+    let pending = view
+        .pending_messages
+        .iter()
+        .filter(|message| message.spoke_id == key.spoke_id && message.project_id == key.project_id);
+    let send_disabled = composer().trim().is_empty();
+    let send_runtime = runtime.clone();
+    let send_key = key.clone();
+    let keyboard_runtime = runtime.clone();
+    let keyboard_key = key.clone();
+    let projection_runtime = runtime.clone();
+    let projection_key = key.clone();
+    let path = snapshot.project.cwd.clone();
+
+    rsx! {
+        section { class: "chat-view",
+            header { class: "chat-header",
+                div { class: "chat-identity",
+                    div { class: "project-avatar", "{initials}" }
+                    div {
+                        div { class: "title-line",
+                            h1 { "{snapshot.project.name}" }
+                            span { class: "status-chip {status}", "{status_label}" }
+                        }
+                        p { "{snapshot.project.cwd}" }
+                    }
+                }
+                div { class: "chat-actions",
+                    button { class: "secondary-button", onclick: move |_| projection_runtime.projection(&projection_key), "View intent" }
+                }
+            }
+            if let Some(gap) = snapshot.gap_before {
+                div { class: "context-warning", "Some earlier timeline detail is unavailable before cursor {gap}. The current project snapshot remains authoritative." }
+            }
+            div { class: "timeline",
+                if snapshot.timeline.is_empty() {
+                    div { class: "timeline-empty", "Describe what should change to begin this Intent Chat." }
+                }
+                for item in &snapshot.timeline {
+                    {render_timeline_item(item)}
+                }
+                for message in pending {
+                    article { class: "timeline-item user_intent pending-item", key: "{message.local_id}",
+                        div { class: "timeline-body",
+                            div { class: "timeline-meta", b { "You" } span { class: "pending-dot" } }
+                            div { class: "timeline-content", "{message.message}" }
+                        }
+                    }
+                }
+            }
+            div { class: "interaction-stack",
+                for interaction in active_interactions {
+                    {render_interaction(interaction, runtime, interaction_answer)}
+                }
+            }
+            div { class: "composer-wrap",
+                form { class: "composer", onsubmit: move |event| { event.prevent_default(); let message = composer(); if !message.trim().is_empty() { send_runtime.send_intent(send_key.clone(), message); composer.set(String::new()); } },
+                    textarea {
+                        rows: "2",
+                        placeholder: "Describe what should change…",
+                        value: "{composer}",
+                        oninput: move |event| composer.set(event.value()),
+                        onkeydown: move |event| {
+                            if event.key() == Key::Enter
+                                && !event.modifiers().contains(Modifiers::SHIFT)
+                                && !event.is_composing()
+                            {
+                                event.prevent_default();
+                                let message = composer();
+                                if !message.trim().is_empty() {
+                                    keyboard_runtime.send_intent(keyboard_key.clone(), message);
+                                    composer.set(String::new());
+                                }
+                            }
+                        },
+                    }
+                    div { class: "composer-footer",
+                        div { class: "composer-context",
+                            span { "{path}" }
+                            span { class: "risk-note", "Consequential actions require confirmation" }
+                        }
+                        div { class: "composer-actions",
+                            span { class: "shortcut-hint", "Enter to send" }
+                            button { class: "send-button", r#type: "submit", disabled: send_disabled, "↑" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_timeline_item(item: &TimelineItem) -> Element {
+    let kind = enum_class(&item.kind);
+    let actor = if item.kind == TimelineKind::UserIntent {
+        "You"
+    } else {
+        "PumpkinPi"
+    };
+    let icon = match item.kind {
+        TimelineKind::UserIntent => "U",
+        TimelineKind::Question | TimelineKind::ConsequentialPrompt => "?",
+        TimelineKind::Outcome | TimelineKind::Evidence | TimelineKind::IntentUpdate => "✓",
+        TimelineKind::Error => "!",
+        TimelineKind::Progress => "…",
+        _ => "P",
+    };
+    let content = item
+        .content
+        .as_deref()
+        .or(item.summary.as_deref())
+        .unwrap_or("Update");
+    let revision = item.source_of_intent_revision;
+
+    rsx! {
+        article { class: "timeline-item {kind}", key: "{item.timeline_item_id}",
+            div { class: "timeline-icon", "{icon}" }
+            div { class: "timeline-body",
+                div { class: "timeline-meta",
+                    b { "{actor}" }
+                    time { "#{item.cursor}" }
+                    if let Some(revision) = revision { span { class: "revision-tag", "intent r{revision}" } }
+                }
+                if item.summary.is_some() && item.content.is_some() {
+                    div { class: "timeline-summary", "{item.summary.as_deref().unwrap_or_default()}" }
+                }
+                div { class: "timeline-content", "{content}" }
+            }
+        }
+    }
+}
+
+fn render_interaction(
+    interaction: &InteractionView,
+    runtime: &GuiRuntime,
+    mut answer: Signal<String>,
+) -> Element {
+    let prompt = interaction
+        .payload
+        .get("message")
+        .or_else(|| interaction.payload.get("prompt"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| interaction.payload.to_string());
+    let approve_runtime = runtime.clone();
+    let approve_interaction = interaction.clone();
+    let deny_runtime = runtime.clone();
+    let deny_interaction = interaction.clone();
+    let answer_runtime = runtime.clone();
+    let answer_interaction = interaction.clone();
+
+    rsx! {
+        article { class: "interaction-card", key: "{interaction.operation_id}-{interaction.request_id}",
+            h3 { "Action required · {interaction.method}" }
+            p { "{prompt}" }
+            div { class: "interaction-actions",
+                input { placeholder: "Type a response…", value: "{answer}", oninput: move |event| answer.set(event.value()) }
+                button { class: "secondary-button", onclick: move |_| deny_runtime.answer(&deny_interaction, Value::Bool(false)), "Deny" }
+                button { class: "secondary-button", onclick: move |_| { let response = Value::String(answer()); answer_runtime.answer(&answer_interaction, response); answer.set(String::new()); }, "Reply" }
+                button { class: "primary-button", onclick: move |_| approve_runtime.answer(&approve_interaction, Value::Bool(true)), "Approve" }
+            }
+        }
+    }
+}
+
+fn render_inspector(
+    snapshot: Option<&ProjectSnapshot>,
+    view: &UiState,
+    runtime: &GuiRuntime,
+    tab: InspectorTab,
+) -> Element {
+    if tab == InspectorTab::Diagnostics {
+        let connection = &view.connection;
+        return rsx! {
+            div {
+                section { class: "inspector-section",
+                    h2 { "Connection" }
+                    dl { class: "context-card",
+                        div { class: "context-row", dt { "State" } dd { "{connection.label}" } }
+                        div { class: "context-row", dt { "Hub" } dd { "{view.hub_url}" } }
+                        if let Some(reason) = &connection.reason {
+                            div { class: "context-row", dt { "Detail" } dd { "{reason}" } }
+                        }
+                    }
+                }
+                section { class: "inspector-section",
+                    h2 { "Event log" }
+                    if view.diagnostics.is_empty() {
+                        div { class: "inspector-empty compact", "No diagnostics have been reported." }
+                    }
+                    for (index, line) in view.diagnostics.iter().take(100).enumerate() {
+                        div { class: "diagnostic-line", key: "{index}", "{line}" }
+                    }
+                }
+            }
+        };
+    }
+
+    let Some(snapshot) = snapshot else {
+        return rsx! { div { class: "inspector-empty", "Select a project to inspect its context and activity." } };
+    };
+
+    if tab == InspectorTab::Activity {
+        return rsx! {
+            div {
+                section { class: "inspector-section",
+                    h2 { "Operations · {snapshot.operations.len()}" }
+                    if snapshot.operations.is_empty() {
+                        div { class: "inspector-empty compact", "No operations yet. Send an intent to begin work." }
+                    }
+                    for operation in snapshot.operations.iter().rev() {
+                        {
+                            let runtime = runtime.clone();
+                            let cancel_operation = operation.clone();
+                            let status = enum_class(&operation.status);
+                            let active = is_active(&operation.status);
+                            rsx! {
+                                div { class: "operation-row", key: "{operation.operation_id}",
+                                    header {
+                                        b { "{operation.kind}" }
+                                        span { class: "operation-state {status}", "{status}" }
+                                    }
+                                    p { class: "operation-id", "{operation.operation_id}" }
+                                    if let Some(error) = &operation.error {
+                                        p { class: "operation-error", "{error}" }
+                                    }
+                                    if active {
+                                        button { class: "text-button", onclick: move |_| runtime.cancel(&cancel_operation), "Cancel operation" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    let source_status = enum_class(&snapshot.source.status);
+    let initialization = enum_class(&snapshot.project.initialization_status);
+    let realization = enum_class(&snapshot.project.realization_status);
+    let latest_review = snapshot
+        .reviews
+        .iter()
+        .max_by_key(|review| review.created_at);
+    let provider = snapshot
+        .project
+        .default_provider
+        .as_deref()
+        .unwrap_or("Not set");
+    let model = snapshot
+        .project
+        .default_model
+        .as_deref()
+        .unwrap_or("Not set");
+
+    rsx! {
+        div {
+            section { class: "inspector-section",
+                h2 { "Source of Intent" }
+                div { class: "intent-meter",
+                    header { b { "Revision {snapshot.source.revision}" } span { "{source_status}" } }
+                    p { "{snapshot.source.format} · {snapshot.source.content_hash}" }
+                    if let Some(bundle_hash) = &snapshot.source.authoritative_bundle_hash {
+                        p { {format!("{} exact authoritative documents · bundle {}", snapshot.source.authoritative_document_count, bundle_hash)} }
+                    }
+                }
+            }
+            if let Some(review) = latest_review {
+                section { class: "inspector-section",
+                    h2 { "Latest independent review" }
+                    div { class: "context-card",
+                        p { b { "{enum_class(&review.verdict)}" } " · revision {review.source_of_intent_revision}" }
+                        p { {format!("{} finding(s) · {} required scope item(s) unreviewed", review.findings.len(), review.unreviewed_required_scope.len())} }
+                    }
+                }
+            }
+            section { class: "inspector-section",
+                h2 { "Project context" }
+                dl { class: "context-card",
+                    div { class: "context-row", dt { "Spoke" } dd { "{snapshot.project.spoke_id}" } }
+                    div { class: "context-row", dt { "Path" } dd { "{snapshot.project.cwd}" } }
+                    div { class: "context-row", dt { "Initialized" } dd { "{initialization}" } }
+                    div { class: "context-row", dt { "Realization" } dd { "{realization}" } }
+                    div { class: "context-row", dt { "Provider" } dd { "{provider}" } }
+                    div { class: "context-row", dt { "Model" } dd { "{model}" } }
+                    div { class: "context-row", dt { "Trust" } dd { if snapshot.project.trusted { "Trusted" } else { "Untrusted" } } }
+                }
+            }
+        }
+    }
+}
+
+async fn protocol_actor(runtime: GuiRuntime, commands: mpsc::Receiver<ActorCommand>) {
+    let mut attempt = 0u32;
+    let mut subscriptions = BTreeMap::<ProjectKey, u64>::new();
+
+    loop {
+        let config = match client_config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                runtime.set_connection(ConnectionView {
+                    kind: ConnectionKind::Degraded,
+                    label: "Configuration error".into(),
+                    attempt,
+                    reason: Some(error.to_string()),
+                });
+                return;
+            }
+        };
+        let Some(token) = client_config::resolve_token().ok().flatten() else {
+            runtime.set_connection(ConnectionView {
+                kind: ConnectionKind::Disconnected,
+                label: "Login required".into(),
+                attempt,
+                reason: Some("Enter your personal Hub URL and owner token.".into()),
+            });
+            return;
+        };
+
+        runtime.set_connection(if attempt == 0 {
+            ConnectionView::simple(ConnectionKind::Connecting, "Connecting")
+        } else {
+            ConnectionView {
+                kind: ConnectionKind::Reconnecting,
+                label: format!("Reconnecting · attempt {attempt}"),
+                attempt,
+                reason: None,
+            }
+        });
+
+        match connect_async(&config.hub).await {
+            Ok((socket, _)) => {
+                let (mut write, mut read) = socket.split();
+                runtime.set_connection(ConnectionView::simple(
+                    ConnectionKind::Authenticating,
+                    "Authenticating",
+                ));
+                let auth = ClientHello::Auth {
+                    protocol_version: PROTOCOL_VERSION,
+                    token: token.clone(),
+                };
+                if write
+                    .send(Message::Text(
+                        serde_json::to_string(&auth)
+                            .expect("auth serializes")
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    attempt += 1;
+                    continue;
+                }
+                let Some(Ok(Message::Text(first))) = read.next().await else {
+                    attempt += 1;
+                    continue;
+                };
+                let Ok(first) = serde_json::from_str::<ClientEvent>(&first) else {
+                    attempt += 1;
+                    continue;
+                };
+                if !matches!(first.payload, ClientPayload::Authenticated) {
+                    runtime.apply(first);
+                    return;
+                }
+
+                attempt = 0;
+                runtime.set_connection(ConnectionView::simple(
+                    ConnectionKind::Connected,
+                    "Connected",
+                ));
+                let _ = send_command(&mut write, ClientCommand::SpokeList).await;
+                let _ =
+                    send_command(&mut write, ClientCommand::ProjectList { spoke_id: None }).await;
+                for (key, cursor) in &subscriptions {
+                    let _ = send_command(
+                        &mut write,
+                        ClientCommand::IntentSubscribe {
+                            spoke_id: key.spoke_id.clone(),
+                            project_id: key.project_id.clone(),
+                            cursor: Some(*cursor),
+                        },
+                    )
+                    .await;
+                }
+
+                'connected: loop {
+                    tokio::select! {
+                        incoming = read.next() => {
+                            let Some(Ok(Message::Text(text))) = incoming else { break 'connected };
+                            match serde_json::from_str::<ClientEvent>(&text) {
+                                Ok(event) => {
+                                    if let ClientPayload::Timeline { item } = &event.payload {
+                                        subscriptions.insert(ProjectKey { spoke_id: item.spoke_id.clone(), project_id: item.project_id.clone() }, item.cursor);
+                                    }
+                                    runtime.apply(event);
+                                }
+                                Err(error) => runtime.diagnostic(format!("Invalid Hub event: {error}")),
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                            loop {
+                                match commands.try_recv() {
+                                    Ok(ActorCommand::Request(command)) => {
+                                        if let ClientCommand::IntentSubscribe { spoke_id, project_id, cursor } = &command {
+                                            subscriptions.insert(ProjectKey { spoke_id: spoke_id.clone(), project_id: project_id.clone() }, cursor.unwrap_or(0));
+                                        }
+                                        if send_command(&mut write, command).await.is_err() { break 'connected }
+                                    }
+                                    Ok(ActorCommand::Stop) => return,
+                                    Err(mpsc::TryRecvError::Empty) => break,
+                                    Err(mpsc::TryRecvError::Disconnected) => return,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                runtime.set_connection(ConnectionView {
+                    kind: ConnectionKind::Degraded,
+                    label: "Hub unavailable".into(),
+                    attempt,
+                    reason: Some(error.to_string()),
+                });
+            }
+        }
+
+        attempt += 1;
+        tokio::time::sleep(Duration::from_secs(u64::from(attempt.min(5)))).await;
+    }
+}
+
+async fn send_command<W>(write: &mut W, command: ClientCommand) -> std::result::Result<(), W::Error>
+where
+    W: SinkExt<Message> + Unpin,
+{
+    let request = ClientRequest {
+        protocol_version: PROTOCOL_VERSION,
+        id: RequestId(Uuid::new_v4().to_string()),
+        command,
+    };
+    write
+        .send(Message::Text(
+            serde_json::to_string(&request)
+                .expect("client request serializes")
+                .into(),
+        ))
+        .await
 }
 
 pub(crate) fn run() -> Result<()> {
-    let options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "PumpkinPi",
-        options,
-        Box::new(|_cc| Ok(Box::<PumpkinPiApp>::default())),
-    )
-    .map_err(|err| anyhow!(err.to_string()))
-}
-
-struct PumpkinPiApp {
-    hub: String,
-    token: Option<String>,
-    login_token: String,
-    status: String,
-    tx: Option<mpsc::Sender<WsCommand>>,
-    rx: Option<mpsc::Receiver<WsEvent>>,
-    nodes: Vec<Value>,
-    projects: Vec<Value>,
-    sessions: Vec<Value>,
-    selected_node: Option<String>,
-    selected_project: Option<String>,
-    selected_session: Option<String>,
-    transcript: Vec<String>,
-    prompt: String,
-}
-
-impl Default for PumpkinPiApp {
-    fn default() -> Self {
-        let config = client_config::load().unwrap_or_default();
-        let token = client_config::resolve_token().unwrap_or(config.token.clone());
-        Self {
-            hub: config.hub,
-            token,
-            login_token: String::new(),
-            status: "Disconnected".to_string(),
-            tx: None,
-            rx: None,
-            nodes: Vec::new(),
-            projects: Vec::new(),
-            sessions: Vec::new(),
-            selected_node: None,
-            selected_project: None,
-            selected_session: None,
-            transcript: Vec::new(),
-            prompt: String::new(),
-        }
-    }
-}
-
-impl eframe::App for PumpkinPiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
-
-        egui::TopBottomPanel::top("connection").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Hub");
-                ui.text_edit_singleline(&mut self.hub);
-                if self.token.is_some() {
-                    ui.label("Logged in");
-                } else {
-                    ui.label("Login token");
-                    ui.add(egui::TextEdit::singleline(&mut self.login_token).password(true));
-                    if ui.button("Save login").clicked() {
-                        match client_config::login(self.hub.clone(), self.login_token.clone()) {
-                            Ok(_) => {
-                                self.token = Some(self.login_token.clone());
-                                self.login_token.clear();
-                                self.status = "Login saved".to_string();
-                            }
-                            Err(err) => self.status = format!("Login failed: {err}"),
-                        }
-                    }
-                }
-                if ui.button("Connect").clicked() {
-                    self.connect();
-                }
-                if ui.button("Refresh").clicked() {
-                    self.send(WsCommand::ListNodes);
-                }
-                ui.label(&self.status);
-            });
-        });
-
-        egui::SidePanel::left("inventory")
-            .resizable(true)
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                ui.heading("Nodes");
-                for node in self.nodes.clone() {
-                    let id = field(&node, "node_id");
-                    let selected = self.selected_node.as_deref() == Some(id.as_str());
-                    if ui
-                        .selectable_label(selected, label(&node, "node_id"))
-                        .clicked()
-                    {
-                        self.selected_node = Some(id.clone());
-                        self.selected_project = None;
-                        self.selected_session = None;
-                        self.projects.clear();
-                        self.sessions.clear();
-                        self.transcript.clear();
-                        self.send(WsCommand::ListProjects { node_id: id });
-                    }
-                }
-
-                ui.separator();
-                ui.heading("Projects");
-                for project in self.projects.clone() {
-                    let id = field(&project, "project_id");
-                    let selected = self.selected_project.as_deref() == Some(id.as_str());
-                    if ui
-                        .selectable_label(selected, label(&project, "project_id"))
-                        .clicked()
-                    {
-                        self.selected_project = Some(id.clone());
-                        self.selected_session = None;
-                        self.sessions.clear();
-                        self.transcript.clear();
-                        if let Some(node_id) = self.selected_node.clone() {
-                            self.send(WsCommand::ListSessions {
-                                node_id,
-                                project_id: id,
-                            });
-                        }
-                    }
-                }
-
-                ui.separator();
-                ui.heading("Sessions");
-                for session in self.sessions.clone() {
-                    let id = field(&session, "session_id");
-                    let selected = self.selected_session.as_deref() == Some(id.as_str());
-                    if ui
-                        .selectable_label(selected, label(&session, "session_id"))
-                        .clicked()
-                    {
-                        self.selected_session = Some(id.clone());
-                        self.transcript.clear();
-                        if let (Some(node_id), Some(project_id)) =
-                            (self.selected_node.clone(), self.selected_project.clone())
-                        {
-                            self.send(WsCommand::Subscribe {
-                                node_id,
-                                project_id,
-                                session_id: id,
-                            });
-                        }
-                    }
-                }
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Session");
-            egui::ScrollArea::vertical()
-                .id_source("transcript")
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.transcript {
-                        ui.label(line);
-                    }
-                });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let response = ui.add_sized(
-                    [ui.available_width() - 80.0, 28.0],
-                    egui::TextEdit::singleline(&mut self.prompt).hint_text("Send a prompt..."),
-                );
-                let pressed_enter =
-                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if ui.button("Send").clicked() || pressed_enter {
-                    self.send_prompt();
-                }
-            });
-        });
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
-}
-
-impl PumpkinPiApp {
-    fn connect(&mut self) {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let hub = self.hub.clone();
-        let Some(token) = self.token.clone() else {
-            self.status =
-                "Not logged in; run `pumpkinpi login --token ...` or save a token here".to_string();
-            return;
-        };
-        let _ = client_config::save(&client_config::ClientConfig {
-            hub: hub.clone(),
-            token: Some(token.clone()),
-        });
-        self.status = "Connecting...".to_string();
-        self.tx = Some(cmd_tx);
-        self.rx = Some(event_rx);
-        self.nodes.clear();
-        self.projects.clear();
-        self.sessions.clear();
-        self.transcript.clear();
-        thread::spawn(move || match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime.block_on(ws_actor(hub, token, cmd_rx, event_tx)),
-            Err(err) => {
-                let _ = event_tx.send(WsEvent::Error(err.to_string()));
-            }
-        });
-    }
-
-    fn drain_events(&mut self) {
-        let mut events = Vec::new();
-        if let Some(rx) = &self.rx {
-            while let Ok(event) = rx.try_recv() {
-                events.push(event);
-            }
-        }
-        for event in events {
-            match event {
-                WsEvent::Connected => self.status = "Connected".to_string(),
-                WsEvent::Incoming(value) => self.handle_value(value),
-                WsEvent::Error(err) => {
-                    self.status = format!("Error: {err}");
-                    self.transcript.push(format!("error: {err}"));
-                }
-                WsEvent::Disconnected => self.status = "Disconnected".to_string(),
-            }
-        }
-    }
-
-    fn handle_value(&mut self, value: Value) {
-        match value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
-            "node.list.result" => self.nodes = array(&value, "nodes"),
-            "project.list.result" => self.projects = array(&value, "projects"),
-            "session.list.result" => self.sessions = array(&value, "sessions"),
-            "session.output_delta" => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                    self.transcript.push(delta.to_string());
-                }
-            }
-            "session.message_end" => self.transcript.push(format!("\n{}", compact(&value))),
-            "session.running" | "session.idle" | "session.turn_ended" => {
-                self.transcript.push(format!("[{}]", field(&value, "type")));
-            }
-            "error" => self
-                .transcript
-                .push(format!("error: {}", field(&value, "error"))),
-            _ => self.transcript.push(compact(&value)),
-        }
-    }
-
-    fn send(&mut self, command: WsCommand) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(command);
-        }
-    }
-
-    fn send_prompt(&mut self) {
-        let message = self.prompt.trim().to_string();
-        if message.is_empty() {
-            return;
-        }
-        if let (Some(node_id), Some(project_id), Some(session_id)) = (
-            self.selected_node.clone(),
-            self.selected_project.clone(),
-            self.selected_session.clone(),
-        ) {
-            self.transcript.push(format!("You: {message}"));
-            self.prompt.clear();
-            self.send(WsCommand::SendPrompt {
-                node_id,
-                project_id,
-                session_id,
-                message,
-            });
-        }
-    }
-}
-
-async fn ws_actor(
-    hub: String,
-    token: String,
-    cmd_rx: mpsc::Receiver<WsCommand>,
-    event_tx: mpsc::Sender<WsEvent>,
-) {
-    if let Err(err) = ws_actor_inner(hub, token, cmd_rx, event_tx.clone()).await {
-        let _ = event_tx.send(WsEvent::Error(err.to_string()));
-    }
-    let _ = event_tx.send(WsEvent::Disconnected);
-}
-
-async fn ws_actor_inner(
-    hub: String,
-    token: String,
-    cmd_rx: mpsc::Receiver<WsCommand>,
-    event_tx: mpsc::Sender<WsEvent>,
-) -> Result<()> {
-    let (socket, _) = connect_async(&hub).await?;
-    let (mut write, mut read) = socket.split();
-    write
-        .send(Message::Text(
-            json!({"protocol_version": PROTOCOL_VERSION, "type":"client.auth", "token": token})
-                .to_string()
-                .into(),
-        ))
-        .await?;
-
-    loop {
-        let Some(msg) = read.next().await else {
-            return Err(anyhow!("connection closed before authentication"));
-        };
-        let Message::Text(text) = msg? else { continue };
-        let value: Value = serde_json::from_str(&text)?;
-        match value.get("type").and_then(Value::as_str) {
-            Some("client.authenticated") => break,
-            Some("error") => return Err(anyhow!(field(&value, "error"))),
-            _ => {}
-        }
-    }
-
-    let _ = event_tx.send(WsEvent::Connected);
-    let mut next_id = 1_u64;
-    send_request(&mut write, &mut next_id, json!({"type":"node.list"})).await?;
-
-    let mut command_tick = tokio::time::interval(std::time::Duration::from_millis(50));
-    loop {
-        tokio::select! {
-            msg = read.next() => {
-                let Some(msg) = msg else { break; };
-                let Message::Text(text) = msg? else { continue; };
-                let value: Value = serde_json::from_str(&text)?;
-                let _ = event_tx.send(WsEvent::Incoming(value));
-            }
-            _ = command_tick.tick() => {
-                loop {
-                    let command = match cmd_rx.try_recv() {
-                        Ok(command) => command,
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return Ok(()),
-                    };
-                    match command {
-                        WsCommand::ListNodes => send_request(&mut write, &mut next_id, json!({"type":"node.list"})).await?,
-                        WsCommand::ListProjects { node_id } => send_request(&mut write, &mut next_id, json!({"type":"project.list", "node_id": node_id})).await?,
-                        WsCommand::ListSessions { node_id, project_id } => send_request(&mut write, &mut next_id, json!({"type":"session.list", "node_id": node_id, "project_id": project_id})).await?,
-                        WsCommand::Subscribe { node_id, project_id, session_id } => send_request(&mut write, &mut next_id, json!({"type":"session.subscribe", "node_id": node_id, "project_id": project_id, "session_id": session_id})).await?,
-                        WsCommand::SendPrompt { node_id, project_id, session_id, message } => send_request(&mut write, &mut next_id, json!({"type":"session.send", "node_id": node_id, "project_id": project_id, "session_id": session_id, "command":{"type":"prompt", "message": message}})).await?,
-                    }
-                }
-            }
-        }
-    }
+    let window = dioxus_native::WindowAttributes::default()
+        .with_title("PumpkinPi")
+        .with_surface_size(dioxus_native::LogicalSize::new(1440.0, 900.0))
+        .with_min_surface_size(dioxus_native::LogicalSize::new(900.0, 620.0));
+    let config = dioxus_native::Config::new().with_window_attributes(window);
+    dioxus_native::launch_cfg(app, vec![], vec![Box::new(config)]);
     Ok(())
-}
-
-async fn send_request(
-    write: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >,
-    next_id: &mut u64,
-    mut value: Value,
-) -> Result<()> {
-    value["protocol_version"] = json!(PROTOCOL_VERSION);
-    value["id"] = json!(format!("gui-{next_id}"));
-    *next_id += 1;
-    write.send(Message::Text(value.to_string().into())).await?;
-    Ok(())
-}
-
-fn array(value: &Value, key: &str) -> Vec<Value> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn field(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| value.get(key).map(Value::to_string).unwrap_or_default())
-}
-
-fn label(value: &Value, id_key: &str) -> String {
-    let id = field(value, id_key);
-    let name = field(value, "name");
-    let status = field(value, "status");
-    match (name.is_empty(), status.is_empty()) {
-        (false, false) => format!("{name} ({id}) · {status}"),
-        (false, true) => format!("{name} ({id})"),
-        (true, false) => format!("{id} · {status}"),
-        (true, true) => id,
-    }
-}
-
-fn compact(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())
 }

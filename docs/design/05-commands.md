@@ -1,102 +1,79 @@
 # Commands
 
-## Command Categories
+## Command Boundary
 
-### Hub-level Commands
+Normal Clients issue Project/Intent Chat commands. Session commands are an internal orchestration and diagnostics API. The public product must not require the user to create, name, attach to, or queue internal Sessions.
+
+## User-Facing Commands
+
+### Hub / Project Discovery
 
 ```json
 {"type":"hub.status"}
-{"type":"node.list"}
-{"type":"node.get","node_id":"node_home"}
+{"type":"spoke.list"}
+{"type":"project.list"}
+{"type":"project.get","spoke_id":"spoke_home","project_id":"proj_api"}
 ```
 
-### Project Commands
+### Project Initialization
 
 ```json
-{"type":"project.list","node_id":"node_home"}
-{"type":"project.add","node_id":"node_home","cwd":"/home/me/app","name":"app"}
-{"type":"project.remove","node_id":"node_home","project_id":"proj_api"}
-{"type":"project.get","node_id":"node_home","project_id":"proj_api"}
+{"type":"project.initialize","spoke_id":"spoke_home","cwd":"/home/me/app","name":"app"}
+{"type":"project.initialization_status","spoke_id":"spoke_home","project_id":"proj_app"}
+{"type":"project.remove","spoke_id":"spoke_home","project_id":"proj_app"}
 ```
 
-### Session Commands
+Initialization inspects local context and opens Intent Chat to assemble the initial Source of Intent. It is a lifecycle, not a single synchronous directory-registration call.
 
-Session commands should include full routing metadata. `project_id` is optional only when `session_id` is globally unique and the hub/node can resolve it unambiguously.
+### Intent Chat
 
 ```json
-{"type":"session.create","node_id":"node_home","project_id":"proj_api","name":"fix-tests"}
-{"type":"session.list","node_id":"node_home","project_id":"proj_api"}
-{"type":"session.attach","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.detach","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.subscribe","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.stop","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.restart","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.delete","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests"}
-{"type":"session.send","node_id":"node_home","project_id":"proj_api","session_id":"sess_tests","command":{"type":"prompt","message":"hello"}}
+{"type":"intent.send","spoke_id":"spoke_home","project_id":"proj_app","message":"The CLI should support JSON output"}
+{"type":"intent.cancel","spoke_id":"spoke_home","project_id":"proj_app","operation_id":"op_123"}
+{"type":"intent.subscribe","spoke_id":"spoke_home","project_id":"proj_app","cursor":"42"}
+{"type":"intent.get_projection","spoke_id":"spoke_home","project_id":"proj_app","projection":"summary"}
 ```
 
-### Pi RPC Command Adapter
+`intent.send` may clarify intent, update the Source of Intent, initiate work, answer a question, or request an explanation. The Intent Agent interprets the message in Project context; the user need not choose an internal command category.
 
-The session command payload should use PumpkinPi command types that the Node translates into documented Pi RPC commands. Initially these may closely match Pi RPC names, including:
+`intent.get_projection` asks an LLM to render canonical Source of Intent state into a human-readable summary, explanation, diff, or other supported projection. It does not expose canonical storage as the normal UI.
 
-- `prompt`
-- `steer`
-- `follow_up`
-- `abort`
-- `clear_queue`
-- `new_session` deny unless wrapped
-- `get_state`
-- `get_messages`
-- `set_model`
-- `cycle_model`
-- `get_available_models`
-- `set_thinking_level`
-- `cycle_thinking_level`
-- `get_available_thinking_levels`
-- `set_steering_mode`
-- `set_follow_up_mode`
-- `compact`
-- `set_auto_compaction`
-- `set_auto_retry`
-- `abort_retry`
-- `bash`
-- `abort_bash`
-- `get_session_stats`
-- `export_html`
-- `switch_session` deny unless wrapped
-- `fork` deny unless wrapped
-- `clone` deny unless wrapped
-- `get_fork_messages`
-- `get_entries`
-- `get_tree`
-- `get_last_assistant_text`
-- `set_session_name`
-- `get_commands`
-- `extension_ui_response`
+## Internal Session Commands
 
-Important security caveat: dangerous behavior is not limited to direct RPC `bash`. Prompts can induce tool calls, extension commands can execute immediately, and `/skill:*` or prompt-template expansion can change behavior. Since Node access is admin-level access, PumpkinPi should expose these behaviors clearly in UX and audit. The Node should distinguish:
+Internal commands include Session create/list/subscribe/stop/restart/delete/send and full routing metadata. They are used by PumpkinPi orchestration and diagnostics, not ordinary Intent Chat UI.
 
-- direct RPC `bash`, which emits `bash_execution_update`
-- agent tool executions, which emit `tool_execution_*`
-- extension commands invoked through `prompt`
-- project/user/path skills and prompt templates returned by `get_commands`
+The Session payload uses PumpkinPi command types translated by the Spoke into documented Pi RPC commands, including prompt/steer/follow-up, abort/clear queue, model/settings/state queries, direct bash, session stats, entry retrieval, extension UI responses, and compaction/retry controls.
 
-Session-switching commands must remain denied until PumpkinPi wrappers can update the Node session registry atomically.
+Pi commands that mutate internal Session binding (`new_session`, `switch_session`, `fork`, `clone`) remain denied unless a PumpkinPi wrapper atomically updates the Session registry.
+
+Danger is not limited to direct RPC `bash`: prompts can induce tools, extensions can execute immediately, and skills/templates can change behavior. UX, evidence, and audit should distinguish direct bash, agent tool execution, extension commands, and prompt/skill expansion.
+
+## Intent Revision Semantics
+
+Operations that implement or validate intent record the Source of Intent revision they target.
+
+If a newer revision appears:
+
+- harmless inspection may continue and report its revision
+- implementation/validation must be assessed for staleness
+- incompatible work should be cancelled or superseded
+- outcomes must not be claimed against a revision they did not evaluate
+
+Source of Intent writes use optimistic revision checks or equivalent atomic serialization to prevent lost updates.
 
 ## Per-Session Queue Priority
 
-Commands are serialized per session, but cancellation and UI commands must not get stuck behind long-running normal work. Each session queue should have priority lanes:
+Internal commands are serialized per Session, but cancellation and UI responses must not wait behind normal work:
 
-1. **Lifecycle / emergency**: `session.stop`, process kill after timeout, crash cleanup. These are handled by the Node and may bypass Pi stdin.
-2. **Interactive unblock**: `extension_ui_response`. If a dialog request is pending, route this immediately to Pi before normal queued commands.
-3. **Cancellation**: `abort_bash`, `abort_retry`, `clear_queue`, `abort`. These should be accepted while Pi is running and written to Pi as soon as stdin is available, ahead of ordinary commands.
-4. **Normal commands**: `prompt`, `steer`, `follow_up`, model/settings/state/bash/session queries.
+1. lifecycle/emergency stop and process cleanup
+2. blocking `extension_ui_response`
+3. cancellation: abort bash/retry, clear queue, abort
+4. normal prompts, steering, settings, queries, and bash
 
 Rules:
 
-- `extension_ui_response` is valid only for a pending request id; stale or duplicate responses are rejected/dropped.
-- `abort_bash` targets the currently running direct RPC `bash` command for that session.
-- `clear_queue` should precede `abort` for “stop everything” UX because Pi may otherwise continue queued steering/follow-up messages after abort.
-- `session.stop` should first attempt graceful Pi shutdown/abort, then kill the subprocess after a configurable timeout.
-- Normal commands submitted while a session is `crashed`, `missing`, `stopped`, or `stale` are rejected unless the command is an allowed lifecycle/diagnostic command.
-
+- UI responses are valid only for pending request IDs.
+- “Stop everything” clears queued continuations before aborting active work.
+- stop attempts graceful shutdown then kills after timeout.
+- ordinary commands are rejected for crashed, missing, stopped, or stale Sessions.
+- cancelling an internal Run must produce a coherent visible outcome in Intent Chat when it originated from user intent.

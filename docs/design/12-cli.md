@@ -1,23 +1,36 @@
-# Cli
+# CLI
+
+The CLI should preserve the same product model as the GUI: Projects are primarily interacted with through Intent Chat. Internal Session commands belong under diagnostics/development surfaces rather than the normal workflow.
 
 ## Command-Line Shape
 
-Recommended commands:
-
 ```bash
-# Hub
+# Hub administration
 pumpkinpi hub serve --listen 0.0.0.0:8080
-pumpkinpi hub node create --name framework
-pumpkinpi hub node list
-pumpkinpi hub node revoke node_abc
-pumpkinpi hub node issue-setup-key node_abc
+pumpkinpi hub spoke create --name framework
+pumpkinpi hub spoke list
+pumpkinpi hub spoke revoke spoke_abc
+pumpkinpi hub spoke issue-setup-key spoke_abc
 
-# Node
-pumpkinpi node enroll --hub https://hub.example.com --setup-key ppn_setup_x
-pumpkinpi node serve
-pumpkinpi node serve --hub https://hub.example.com
+# Spoke
+pumpkinpi spoke enroll --hub https://hub.example.com --setup-key pps_setup_x
+pumpkinpi spoke serve
+pumpkinpi spoke serve --hub https://hub.example.com
+
+# Project / Intent Chat
+pumpkinpi project init --spoke framework /home/me/app
+pumpkinpi project list
+pumpkinpi project status proj_app
+pumpkinpi chat proj_app
+pumpkinpi intent send proj_app "The CLI should support JSON output"
+pumpkinpi intent summarize proj_app
+
+# Secondary evidence and recovery surfaces
+pumpkinpi project evidence proj_app
+pumpkinpi project diagnostics proj_app
 
 # Optional local-only development mode
-pumpkinpi node serve --local-only --listen 127.0.0.1:4242
+pumpkinpi spoke serve --local-only --listen 127.0.0.1:4242
 ```
 
+`pumpkinpi chat` is the primary interactive CLI experience. It renders human-readable LLM projections; it should not dump canonical Source of Intent storage or expose raw Pi RPC by default.

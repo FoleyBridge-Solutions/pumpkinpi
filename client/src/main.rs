@@ -1,251 +1,377 @@
-use std::{ffi::OsString, process::Command as StdCommand};
-
-use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use anyhow::{Result, anyhow};
+use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use pumpkinpi_protocol::PROTOCOL_VERSION;
-use serde_json::{Value, json};
+use pumpkinpi_protocol::*;
+use std::{
+    ffi::OsString,
+    io::{self, Write},
+    process::Command as ProcessCommand,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-mod cli;
+use uuid::Uuid;
 mod client_config;
 mod gui;
 
-use cli::{Cli, Command, NodeCommand, ProjectCommand, SessionCommand};
-
+#[derive(Parser)]
+#[command(name = "pumpkinpi", version, about = "Intent-first PumpkinPi client")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+#[derive(Subcommand)]
+enum Cmd {
+    Login {
+        #[arg(long, default_value = "ws://127.0.0.1:8080/ws/client")]
+        hub: String,
+        token: String,
+    },
+    Logout,
+    Gui,
+    Hub {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    Spoke {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    Status,
+    Spokes,
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
+    Intent {
+        #[command(subcommand)]
+        cmd: IntentCmd,
+    },
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderCmd,
+    },
+    Chat {
+        spoke_id: String,
+        project_id: String,
+    },
+}
+#[derive(Subcommand)]
+enum ProjectCmd {
+    List {
+        #[arg(long)]
+        spoke_id: Option<String>,
+    },
+    Init {
+        spoke_id: String,
+        cwd: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Status {
+        spoke_id: String,
+        project_id: String,
+    },
+    Remove {
+        spoke_id: String,
+        project_id: String,
+    },
+    Model {
+        spoke_id: String,
+        project_id: String,
+        provider: String,
+        model: String,
+    },
+}
+#[derive(Subcommand)]
+enum ProviderCmd {
+    List,
+    Set {
+        provider_id: String,
+        api_key: String,
+        #[arg(long, default_value = "default")]
+        label: String,
+    },
+    Revoke {
+        provider_account_id: String,
+    },
+}
+#[derive(Subcommand)]
+enum IntentCmd {
+    Send {
+        spoke_id: String,
+        project_id: String,
+        message: String,
+    },
+    Summarize {
+        spoke_id: String,
+        project_id: String,
+    },
+    Cancel {
+        spoke_id: String,
+        project_id: String,
+        operation_id: String,
+    },
+    Answer {
+        spoke_id: String,
+        project_id: String,
+        operation_id: String,
+        request_id: String,
+        response_json: String,
+    },
+}
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
-    match cli.command {
-        Command::Status { hub } => {
-            let hub = client_config::resolve_hub(hub.as_deref())?;
-            request_print(
-                &hub,
-                json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"hub.status"}),
-                false,
-            )
-            .await
-        }
-        Command::Login(args) => {
-            let path = client_config::login(args.hub, args.token)?;
-            println!("saved client login to {}", path.display());
+    match cli.cmd {
+        Cmd::Login { hub, token } => {
+            println!("saved {}", client_config::login(hub, token)?.display());
             Ok(())
         }
-        Command::Logout => {
-            let path = client_config::logout()?;
-            println!("removed saved client token from {}", path.display());
+        Cmd::Logout => {
+            client_config::logout()?;
             Ok(())
         }
-        Command::Config => {
-            let path = client_config::config_path()?;
-            let config = client_config::load()?;
-            println!("config: {}", path.display());
-            println!("hub: {}", config.hub);
-            println!(
-                "token: {}",
-                if config.token.is_some() {
-                    "saved"
-                } else {
-                    "not saved"
-                }
-            );
-            Ok(())
-        }
-        Command::Gui => gui::run(),
-        Command::Hub(args) => exec_external("pumpkinpi-hub", args.args),
-        Command::Node(args) => exec_external("pumpkinpi-node", args.args),
-        Command::Nodes { command, hub } => {
-            let hub = client_config::resolve_hub(hub.as_deref())?;
-            match command {
-            NodeCommand::List => {
-                request_print(
-                    &hub,
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"node.list"}),
-                    false,
-                )
-                .await
-            }
-            NodeCommand::Get { node_id } => {
-                request_print(
-                    &hub,
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"node.get", "node_id": node_id}),
-                    false,
-                )
-                .await
-            }
-        }
-        }
-        Command::Project {
-            command,
-            hub,
-            node_id,
-        } => {
-            let hub = client_config::resolve_hub(hub.as_deref())?;
-            let msg = match command {
-                ProjectCommand::List => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"project.list", "node_id": node_id})
-                }
-                ProjectCommand::Add {
+        Cmd::Gui => gui::run(),
+        Cmd::Hub { args } => exec("pumpkinpi-hub", args),
+        Cmd::Spoke { args } => exec("pumpkinpi-spoke", args),
+        Cmd::Status => one(ClientCommand::HubStatus).await,
+        Cmd::Spokes => one(ClientCommand::SpokeList).await,
+        Cmd::Project { cmd } => {
+            one(match cmd {
+                ProjectCmd::List { spoke_id } => ClientCommand::ProjectList {
+                    spoke_id: spoke_id.map(SpokeId),
+                },
+                ProjectCmd::Init {
+                    spoke_id,
                     cwd,
                     name,
-                    run_as_user,
-                    allow_root_sessions,
-                    default_provider,
-                    default_model,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"project.add", "node_id": node_id, "cwd": cwd, "name": name, "run_as_user": run_as_user, "allow_root_sessions": allow_root_sessions, "default_provider": default_provider, "default_model": default_model})
-                }
-                ProjectCommand::Get { project_id } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"project.get", "node_id": node_id, "project_id": project_id})
-                }
-                ProjectCommand::Remove { project_id } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"project.remove", "node_id": node_id, "project_id": project_id})
-                }
-            };
-            request_print(&hub, msg, true).await
-        }
-        Command::Session {
-            command,
-            hub,
-            node_id,
-        } => {
-            let hub = client_config::resolve_hub(hub.as_deref())?;
-            let msg = match command {
-                SessionCommand::List { project_id } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.list", "node_id": node_id, "project_id": project_id})
-                }
-                SessionCommand::Create {
-                    project_id,
+                } => ClientCommand::ProjectInitialize {
+                    spoke_id: SpokeId(spoke_id),
+                    cwd,
                     name,
-                    run_as_user,
-                    run_as_root,
+                },
+                ProjectCmd::Status {
+                    spoke_id,
+                    project_id,
+                } => ClientCommand::ProjectGet {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                },
+                ProjectCmd::Remove {
+                    spoke_id,
+                    project_id,
+                } => ClientCommand::ProjectRemove {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                },
+                ProjectCmd::Model {
+                    spoke_id,
+                    project_id,
                     provider,
                     model,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.create", "node_id": node_id, "project_id": project_id, "name": name, "run_as_user": run_as_user, "run_as_root": run_as_root, "provider": provider, "model": model})
-                }
-                SessionCommand::Attach {
-                    project_id,
-                    session_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.attach", "node_id": node_id, "project_id": project_id, "session_id": session_id})
-                }
-                SessionCommand::Subscribe {
-                    project_id,
-                    session_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.subscribe", "node_id": node_id, "project_id": project_id, "session_id": session_id})
-                }
-                SessionCommand::Detach {
-                    project_id,
-                    session_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.detach", "node_id": node_id, "project_id": project_id, "session_id": session_id})
-                }
-                SessionCommand::Send {
-                    project_id,
-                    session_id,
-                    provider_account_id,
-                    message,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.send", "node_id": node_id, "project_id": project_id, "session_id": session_id, "provider_account_id": provider_account_id, "command":{"type":"prompt", "message": message}})
-                }
-                SessionCommand::Stop {
-                    project_id,
-                    session_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.stop", "node_id": node_id, "project_id": project_id, "session_id": session_id})
-                }
-                SessionCommand::Restart {
-                    project_id,
-                    session_id,
-                    provider_account_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.restart", "node_id": node_id, "project_id": project_id, "session_id": session_id, "provider_account_id": provider_account_id})
-                }
-                SessionCommand::Delete {
-                    project_id,
-                    session_id,
-                } => {
-                    json!({"protocol_version": PROTOCOL_VERSION, "id":"1", "type":"session.delete", "node_id": node_id, "project_id": project_id, "session_id": session_id})
-                }
-            };
-            request_print(&hub, msg, true).await
+                } => ClientCommand::ProjectModelSet {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                    provider,
+                    model,
+                },
+            })
+            .await
         }
+        Cmd::Intent { cmd } => {
+            one(match cmd {
+                IntentCmd::Send {
+                    spoke_id,
+                    project_id,
+                    message,
+                } => ClientCommand::IntentSend {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                    message,
+                    expected_revision: None,
+                },
+                IntentCmd::Summarize {
+                    spoke_id,
+                    project_id,
+                } => ClientCommand::IntentGetProjection {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                },
+                IntentCmd::Cancel {
+                    spoke_id,
+                    project_id,
+                    operation_id,
+                } => ClientCommand::IntentCancel {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                    operation_id: OperationId(operation_id),
+                },
+                IntentCmd::Answer {
+                    spoke_id,
+                    project_id,
+                    operation_id,
+                    request_id,
+                    response_json,
+                } => ClientCommand::IntentAnswer {
+                    spoke_id: SpokeId(spoke_id),
+                    project_id: ProjectId(project_id),
+                    operation_id: OperationId(operation_id),
+                    request_id,
+                    response: serde_json::from_str(&response_json)?,
+                },
+            })
+            .await
+        }
+        Cmd::Provider { cmd } => {
+            one(match cmd {
+                ProviderCmd::List => ClientCommand::ProviderList,
+                ProviderCmd::Set {
+                    provider_id,
+                    label,
+                    api_key,
+                } => ClientCommand::ProviderSet {
+                    provider_id,
+                    label,
+                    api_key,
+                },
+                ProviderCmd::Revoke {
+                    provider_account_id,
+                } => ClientCommand::ProviderRevoke {
+                    provider_account_id,
+                },
+            })
+            .await
+        }
+        Cmd::Chat {
+            spoke_id,
+            project_id,
+        } => chat(SpokeId(spoke_id), ProjectId(project_id)).await,
     }
 }
-
-fn exec_external(binary: &str, args: Vec<OsString>) -> Result<()> {
-    let status = StdCommand::new(binary)
-        .args(args)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to execute {binary}; ensure it is installed next to pumpkinpi or on PATH"
-            )
-        })?;
+fn exec(binary: &str, args: Vec<OsString>) -> Result<()> {
+    let status = ProcessCommand::new(binary).args(args).status()?;
     if status.success() {
         Ok(())
     } else {
         Err(anyhow!("{binary} exited with {status}"))
     }
 }
-
-async fn request_print(hub: &str, message: Value, wait_for_forwarded: bool) -> Result<()> {
-    let (socket, _) = connect_async(hub).await?;
-    let (mut write, mut read) = socket.split();
-    let token = client_config::resolve_token()?.ok_or_else(|| {
-        anyhow!("not logged in; run `pumpkinpi login --token <token>` or set PUMPKINPI_TOKEN")
-    })?;
-    write
-        .send(Message::Text(
-            json!({"protocol_version": PROTOCOL_VERSION, "type":"client.auth", "token": token})
-                .to_string()
-                .into(),
-        ))
-        .await?;
+async fn connect() -> Result<(
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+)> {
+    let cfg = client_config::load()?;
+    let token = client_config::resolve_token()?.ok_or_else(|| anyhow!("not logged in"))?;
+    let (ws, _) = connect_async(cfg.hub).await?;
+    let (mut w, mut r) = ws.split();
+    w.send(Message::Text(
+        serde_json::to_string(&ClientHello::Auth {
+            protocol_version: PROTOCOL_VERSION,
+            token,
+        })?
+        .into(),
+    ))
+    .await?;
+    let first: ClientEvent = read_event(&mut r).await?;
+    if !matches!(first.payload, ClientPayload::Authenticated) {
+        return Err(anyhow!("authentication failed"));
+    }
+    Ok((w, r))
+}
+async fn one(command: ClientCommand) -> Result<()> {
+    let (mut w, mut r) = connect().await?;
+    let id = RequestId(Uuid::new_v4().to_string());
+    w.send(Message::Text(
+        serde_json::to_string(&ClientRequest {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.clone(),
+            command,
+        })?
+        .into(),
+    ))
+    .await?;
     loop {
-        let Some(msg) = read.next().await else {
-            return Err(anyhow!("connection closed before authentication"));
-        };
-        let Message::Text(text) = msg? else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text)?;
-        match value.get("type").and_then(Value::as_str) {
-            Some("client.authenticated") => break,
-            Some("error") => {
-                return Err(anyhow!(
-                    value
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("authentication failed")
-                        .to_string()
-                ));
-            }
-            _ => continue,
+        let e = read_event(&mut r).await?;
+        if e.id.as_ref() == Some(&id) {
+            println!("{}", serde_json::to_string_pretty(&e)?);
+            return if let ClientPayload::Error { message, .. } = e.payload {
+                Err(anyhow!(message))
+            } else {
+                Ok(())
+            };
         }
     }
-    write
-        .send(Message::Text(message.to_string().into()))
-        .await?;
-    let id = message.get("id").cloned().unwrap_or(Value::Null);
-    while let Some(msg) = read.next().await {
-        let Message::Text(text) = msg? else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text)?;
-        if wait_for_forwarded && value.get("type").and_then(Value::as_str) == Some("accepted") {
-            continue;
-        }
-        if value.get("id") == Some(&id) {
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            return Ok(());
+}
+async fn chat(spoke_id: SpokeId, project_id: ProjectId) -> Result<()> {
+    let (mut w, mut r) = connect().await?;
+    send(
+        &mut w,
+        ClientCommand::IntentSubscribe {
+            spoke_id: spoke_id.clone(),
+            project_id: project_id.clone(),
+            cursor: None,
+        },
+    )
+    .await?;
+    let snap = read_event(&mut r).await?;
+    print_event(&snap);
+    println!("Intent Chat. Enter intent; /quit exits.");
+    let mut lines =
+        tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        tokio::select! {line=lines.next_line()=>{let Some(line)=line? else{break};if line.trim()=="/quit"{break}send(&mut w,ClientCommand::IntentSend{spoke_id:spoke_id.clone(),project_id:project_id.clone(),message:line,expected_revision:None}).await?},event=read_event(&mut r)=>print_event(&event?)}
+    }
+    Ok(())
+}
+async fn send<W: SinkExt<Message> + Unpin>(w: &mut W, command: ClientCommand) -> Result<()>
+where
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    let req = ClientRequest {
+        protocol_version: PROTOCOL_VERSION,
+        id: RequestId(Uuid::new_v4().to_string()),
+        command,
+    };
+    w.send(Message::Text(serde_json::to_string(&req)?.into()))
+        .await
+        .map_err(anyhow::Error::new)
+}
+async fn read_event<
+    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+>(
+    r: &mut R,
+) -> Result<ClientEvent> {
+    loop {
+        let m = r
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("connection closed"))??;
+        if let Message::Text(t) = m {
+            return Ok(serde_json::from_str(&t)?);
         }
     }
-    Err(anyhow!("connection closed before response"))
+}
+fn print_event(e: &ClientEvent) {
+    match &e.payload {
+        ClientPayload::Timeline { item } => println!(
+            "\n{}",
+            item.content
+                .as_deref()
+                .or(item.summary.as_deref())
+                .unwrap_or("")
+        ),
+        ClientPayload::Operation { operation } => println!("[operation {:?}]", operation.status),
+        ClientPayload::Error { message, .. } => eprintln!("error: {message}"),
+        _ => println!("{}", serde_json::to_string_pretty(e).unwrap()),
+    }
 }

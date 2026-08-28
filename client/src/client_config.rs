@@ -48,16 +48,6 @@ pub(crate) fn save(config: &ClientConfig) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(crate) fn resolve_hub(cli_hub: Option<&str>) -> Result<String> {
-    if let Some(hub) = cli_hub {
-        return Ok(hub.to_string());
-    }
-    if let Ok(hub) = std::env::var("PUMPKINPI_HUB") {
-        return Ok(hub);
-    }
-    Ok(load()?.hub)
-}
-
 pub(crate) fn resolve_token() -> Result<Option<String>> {
     if let Ok(token) = std::env::var("PUMPKINPI_TOKEN") {
         return Ok(Some(token));

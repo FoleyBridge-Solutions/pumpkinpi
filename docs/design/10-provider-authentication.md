@@ -1,8 +1,8 @@
 # Provider Authentication
 
-Provider login happens once through the Client. Users should not have to log in to every Node separately.
+Provider login happens once through the Client. The owner should not have to log in separately on every Spoke.
 
-The Client owns the login UX: OAuth browser flows, subscription login prompts, API-key entry, account selection, and provider connection management. The Hub persists the resulting provider account information for the user so it can be reused across Nodes and projects.
+The Client owns the login UX: OAuth browser flows, subscription login prompts, API-key entry, account selection, and provider connection management. The personal Hub persists the resulting provider account information so it can be reused across Spokes and Projects.
 
 Pi supports provider credentials through:
 
@@ -21,48 +21,47 @@ Pi stores credentials by default in:
 
 Pi credential resolution order is:
 
-1. CLI/runtime API key override
+1. CLI/process API key override
 2. `auth.json`
 3. environment variables
 4. custom provider keys from `models.json`
 
-PumpkinPi should make that Pi credential model invisible to end users where possible: the user logs in once in the Client, selects the provider/model in the Client, and PumpkinPi arranges for the Node-launched Pi process to use the selected provider account.
+PumpkinPi should make that Pi credential model invisible to end users where possible: the user logs in once in the Client, selects the provider/model in the Client, and PumpkinPi arranges for the Spoke-launched Pi process to use the selected provider account.
 
 ### Client-Initiated Provider Login Model
 
 ```text
 Client
-  → user logs in to provider once
-Hub
-  → stores provider account/credential material and preferences for the user
+  → owner logs in to provider once
+Personal Hub
+  → stores provider account/credential material and preferences
 Project
   → stores default provider/model selection metadata
-Node
+Spoke
   → receives the provider account material needed to launch/run Pi
 Pi
   → uses that provider account for the session
 ```
 
-The Hub should store provider accounts securely and remember which providers/models each user uses, which providers are available/preferred for each project, recent provider/model choices, and UI selection defaults.
+The Hub should store provider accounts securely and remember provider/model usage, Project preferences, recent choices, and UI selection defaults.
 
-Operational rule: if a user is authorized to access a PumpkinPi Node through the Hub, they have full administrative control over that Node's PumpkinPi capabilities. Node-launched Pi usually runs as the configured project/session user, with root sessions allowed only by policy, but any provider material delivered to the Node for execution must still be considered accessible to that Node, its privileged daemon, and the Pi subprocess effective user.
+Operational rule: an authenticated Client of the personal Hub has administrative control over every enrolled Spoke's PumpkinPi capabilities. Spoke-launched Pi usually runs as the configured Project or Session user, with root Sessions allowed only by policy, but provider material delivered to a Spoke must still be considered accessible to that Spoke, its privileged daemon, and the Pi subprocess effective user.
 
 ### Provider and Model Selection
 
-Clients may request providers and models at project/session creation or during a session. Projects may also define default provider/model settings stored by the Hub as metadata:
+Projects may define default provider/model settings. Users can change these through Project settings or ask through Intent Chat; they do not choose providers separately for each internal Session during normal use.
 
 ```json
 {
-  "type": "session.create",
-  "node_id": "node_home",
+  "type": "project.model.set",
+  "spoke_id": "spoke_home",
   "project_id": "proj_api",
-  "name": "fix-tests",
   "provider": "anthropic",
   "model": "claude-sonnet-4-5:high"
 }
 ```
 
-PumpkinPi provider/model selectors are product-level identifiers. The Hub stores and presents these choices per user and per project. The Node translates them to Pi startup/RPC parameters such as `--provider`, `--model`, `set_model { provider, modelId }`, and `set_thinking_level`, using the selected provider account supplied through PumpkinPi.
+PumpkinPi provider/model selectors are product-level identifiers. The Hub stores and presents choices globally and per Project. Orchestration applies them to internal Sessions, and the Spoke translates them to Pi startup/RPC parameters such as `--provider`, `--model`, `set_model`, and `set_thinking_level`.
 
 ### Hub-Owned Provider Account Store
 
@@ -71,7 +70,6 @@ Hub stores provider credentials encrypted at rest. The credential store uses env
 ```text
 provider_accounts
   provider_account_id
-  user_id
   provider_id
   display_name / account_label
   auth_type: api_key | oauth | subscription | external_secret_ref
@@ -85,10 +83,10 @@ provider_accounts
 
 ### Credential Safety Rules
 
-- Provider login should happen once in the Client, not manually on every Node.
-- Do not install a PumpkinPi Node on a machine unless you trust remote PumpkinPi users to administer that node.
+- Provider login should happen once in the Client, not manually on every Spoke.
+- Do not enroll a Spoke unless every authenticated Client of the personal Hub may administer it through PumpkinPi.
 - Hub may store provider credentials, provider names, account labels, model preferences, availability metadata, and project defaults.
 - Hub must encrypt provider secret values such as API keys, OAuth tokens, refresh tokens, and subscription credentials at rest.
 - Provider secrets should never be sent back to clients after initial entry/login.
-- Node diagnostics and audit logs must avoid recording provider secrets from Pi config files, environment variables, credential payloads, or command output.
+- Spoke diagnostics and audit logs must avoid recording provider secrets from Pi config files, environment variables, credential payloads, or command output.
 

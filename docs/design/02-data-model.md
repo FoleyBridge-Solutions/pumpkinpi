@@ -1,40 +1,30 @@
 # Data Model
 
-### Account / User
+### Personal Hub
 
-A client authenticates to a Hub account. The Hub account is where PumpkinPi remembers the user's global state.
-
-The Hub should persist:
+The initial Hub belongs to one person. It remembers that person's connected Spokes, authenticated Clients, provider credentials, preferences, Projects, and recent Intent Chats/work.
 
 ```text
-user_id / account_id
-email / username
-auth identities
-accessible nodes
+hub_id
+owner identity optional
+authenticated client credentials
+enrolled spokes
 client preferences
-recently used nodes/projects/sessions
+recently used spokes/projects
 provider accounts / credentials
 provider usage/preferences metadata
 created_at
 updated_at
 ```
 
-The Hub account should remember enough metadata to make the client experience seamless across devices:
+An owner identity may be used for login and recovery, but it is not a tenant or sharing boundary. Multiuser access will be designed together with multitenancy.
 
-- which nodes belong to or are shared with the user
-- project/session metadata announced by those nodes
-- provider accounts created from one-time client login
-- provider usage metadata and preferred providers/models
-- default session settings
-- UI preferences
-- audit/history metadata
+The Hub should not store source files by default. Project contents remain on Spokes. Source of Intent, Intent Chat, and evidence may be cached by the Hub only according to explicit retention, confidentiality, and authority rules.
 
-The Hub should not store source files by default. Project contents remain on nodes. Session event history may be cached by Hub only according to explicit retention policy.
-
-### Node
+### Spoke
 
 ```text
-node_id
+spoke_id
 name
 hostname
 version
@@ -49,13 +39,16 @@ public_key or token hash
 
 ### Project
 
-A project is a trusted working directory on a node.
+A Project is a trusted working environment on a Spoke, defined by a Source of Intent and primarily accessed through Intent Chat.
 
 ```text
 project_id
-node_id
+spoke_id
 name
 cwd
+source_of_intent_id
+intent_chat_id
+initialization_status: uninitialized | inspecting | clarifying | ready | failed
 default_pi_args
 default_provider optional
 default_model/settings optional
@@ -67,17 +60,58 @@ created_at
 updated_at
 ```
 
-### Session
+### Source of Intent
 
-A session is one Pi agent conversation/runtime associated with a project.
+The Source of Intent is canonical LLM-facing Project state. Its payload is deliberately representation-agnostic and does not need to be directly readable by users.
+
+```text
+source_of_intent_id
+spoke_id
+project_id
+format/version
+revision
+canonical_payload or storage_ref
+authoritative_bundle optional: manifest path, exact document bytes/paths/sizes/hashes, aggregate bundle hash
+content_hash covering payload and authoritative bundle
+status: absent | assembling | active | updating | conflicted | unavailable
+created_at
+updated_at
+```
+
+Updates must be revisioned and atomic. An internal run should record which Source of Intent revision it was serving. Human-readable summaries and diffs are projections, not canonical truth.
+
+### Intent Chat
+
+Each Project has one primary Intent Chat with stable identity.
+
+```text
+intent_chat_id
+spoke_id
+project_id
+source_of_intent_revision
+status: ready | waiting_for_user | updating_intent | working | blocked | stale
+created_at
+updated_at
+last_active_at
+```
+
+The Intent Chat timeline contains user messages and LLM-generated projections: questions, decisions, progress, outcomes, evidence summaries, reviewer findings/approval, and explanations of Source of Intent changes.
+
+### Internal Session / Run
+
+An internal Session is one persistent LLM execution associated with a Project. It may serve intent maintenance, inspection, implementation, validation, independent review, or recovery. Pi-specific fields describe the current implementation and are not normal user-facing concepts.
 
 ```text
 session_id
-node_id
+run_id optional
+spoke_id
 project_id
-name
+purpose: intent | inspection | implementation | validation | review | recovery
+source_of_intent_revision optional
+parent_operation_id optional
+name internal
 cwd
-status: starting | idle | running | stopped | crashed | missing | stale
+status: starting | idle | running | blocked | stopped | crashed | missing | stale
 run_as_user
 run_as_root: bool
 pi_session_id optional
@@ -89,36 +123,90 @@ updated_at
 last_active_at
 ```
 
-Each active session runtime owns:
+Each active Session owns a Pi child process, IO readers/writer, command queue, subscribers, recent event buffer, state cache, lifecycle watcher, and restart policy.
+
+### Timeline / Evidence
+
+Intent Chat has a normalized, replayable user-facing timeline. Internal Sessions have structured execution timelines that feed evidence and diagnostics.
 
 ```text
-Pi child process
-stdin writer
-stdout reader
-stderr reader
-per-session command queue
-attached/subscribed clients
-recent event ring buffer
-last durable Pi entry id / leaf id
-state cache
-lifecycle watcher
-restart policy
+timeline_item_id
+spoke_id
+project_id
+intent_chat_id optional
+session_id optional
+run_id optional
+source_of_intent_revision optional
+kind: user_intent | question | decision | intent_update | progress | outcome | evidence | tool_execution | extension_ui | lifecycle | error
+visibility: primary | detail | diagnostics
+status optional: queued | running | blocked | completed | failed | cancelled
+summary optional
+content optional
+raw_event_ref optional
+cursor / sequence
+created_at
+updated_at
+completed_at optional
 ```
+
+Raw internal activity should not automatically flood Intent Chat. PumpkinPi promotes only information useful for intent, decision, trust, outcome, or recovery.
+
+### Review / Satisfaction Assessment
+
+Independent review assesses complete observed Project reality against a complete current Source of Intent revision. Findings drive further realization; only approval with no findings and no required scope left unreviewed establishes satisfaction.
+
+```text
+assessment_id
+spoke_id
+project_id
+source_of_intent_revision
+observed_reality_version
+review_run_id
+reviewed_scope
+checks
+findings
+supporting_evidence_ids
+unreviewed_required_scope
+verdict: findings | approved
+status: current | stale
+created_at
+updated_at
+```
+
+Any material intent or Project-reality change makes incompatible approval stale.
+
+### Command / Operation
+
+A command is a user or system operation with a lifecycle. One high-level intent operation may create many internal commands and Sessions.
+
+```text
+operation_id
+origin_client_id optional
+origin_request_id optional
+spoke_id
+project_id optional
+intent_chat_id optional
+session_id optional
+type
+source_of_intent_revision optional
+status: queued | accepted | running | blocked | completed | failed | cancelled | rejected | unknown
+error optional
+created_at
+updated_at
+completed_at optional
+```
+
+Every user-visible action that mutates intent or remote state should have an operation/timeline record so Intent Chat can acknowledge and explain it.
 
 ### Client
 
 ```text
 client_id
-user_id
 connection_id
-subscriptions
+credential_id
+project_subscriptions
 connected_at
+last_seen_cursors
 ```
 
-Client subscriptions are many-to-many. One client may subscribe to many sessions across many nodes, and one session may have many subscribed clients.
-
-```text
-client_id -> set<(node_id, project_id, session_id)>
-session   -> set<client_id>
-```
-
+One Client may subscribe to many Project Intent Chats across many Spokes, and each Intent Chat may have many observing Clients. Internal Session subscriptions are implementation/diagnostic subscriptions rather than the primary Client model.

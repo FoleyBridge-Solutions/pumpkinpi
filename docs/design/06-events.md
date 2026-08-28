@@ -1,8 +1,8 @@
 # Events
 
-The Node consumes Pi events, updates its local session state, and emits normalized PumpkinPi API events to the Hub. Raw Pi events are internal Node inputs, not the Hub/Client protocol.
+The Spoke consumes Pi events, updates its local session state, and emits normalized PumpkinPi API events to the Hub. Raw Pi events are internal Spoke inputs, not the Hub/Client protocol.
 
-Important Pi event inputs for the Node to understand:
+Important Pi event inputs for the Spoke to understand:
 
 - `agent_start`
 - `agent_end`
@@ -27,7 +27,29 @@ Important Pi event inputs for the Node to understand:
 - `extension_error`
 - `extension_ui_request`
 
-Node lifecycle state should treat `agent_settled` as the reliable transition to idle. `agent_end` is only a low-level run completion and may be followed by automatic retry, compaction retry, overflow compaction, or queued continuations.
+Spoke lifecycle state should treat `agent_settled` as the reliable transition to idle. `agent_end` is only a low-level run completion and may be followed by automatic retry, compaction retry, overflow compaction, or queued continuations.
+
+## Normalized Event Families
+
+Public PumpkinPi events should be stable product events. Suggested families:
+
+```text
+spoke.online / spoke.offline / spoke.updated
+project.initializing / project.ready / project.updated / project.missing / project.removed
+intent.message_added / intent.question / intent.decision_recorded
+intent.update_started / intent.updated / intent.conflicted / intent.unavailable
+work.started / work.progress / work.blocked / work.completed / work.failed / work.cancelled
+evidence.added / outcome.reported
+timeline.item_added / timeline.item_updated / timeline.gap
+extension_ui.requested / extension_ui.answered / extension_ui.timed_out
+diagnostics.notice / diagnostics.warning / diagnostics.error
+```
+
+Internal/diagnostic event families additionally include Session lifecycle and command lifecycle events.
+
+Every primary event that targets work includes `spoke_id` and `project_id`; internal events additionally include `session_id`/`run_id`. Intent updates and outcomes include the relevant Source of Intent revision. Timeline events carry a monotonically increasing Intent Chat- or Session-local cursor so clients can replay and detect gaps.
+
+Raw Pi event names may inform implementation, but clients should not need to understand Pi internals to render normal UI.
 
 ## Response Correlation
 
@@ -42,15 +64,15 @@ external id: req-7
 internal pi id: client_abc:req-7
 ```
 
-Node keeps a map:
+Spoke keeps a map:
 
 ```text
 (session_id, internal_pi_id) -> (client_id, external_id)
 ```
 
-When Pi emits a response, Node rewrites the ID back before routing it to the originating client.
+When Pi emits a response, Spoke rewrites the ID back before routing it to the originating client.
 
-Broadcast session events go to all subscribed clients.
+Internal Session events go to orchestration and explicit diagnostic subscribers. PumpkinPi promotes relevant questions, progress, outcomes, evidence, and failures into Project/Intent Chat events for normal Clients.
 
-The node should not promise per-client causality for ordinary agent events unless Pi exposes sufficient metadata. It may annotate events with best-effort `origin_client_id` internally, but clients must rely on `node_id`, `project_id`, and `session_id` for demultiplexing.
+The spoke should not promise per-client causality for ordinary agent events unless Pi exposes sufficient metadata. It may annotate events with best-effort `origin_client_id` internally, but clients must rely on `spoke_id`, `project_id`, and `session_id` for demultiplexing.
 
