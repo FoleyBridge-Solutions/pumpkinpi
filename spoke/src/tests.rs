@@ -572,18 +572,34 @@ import os
 import sys
 
 json.loads(sys.stdin.readline())
+checkpoint = os.path.join(os.getcwd(), "README.md")
 failures = []
-for path in [os.path.join(os.getcwd(), "README.md"), os.environ["REVIEW_HOST_MARKER"]]:
+for path in [checkpoint, os.environ["REVIEW_HOST_MARKER"]]:
     try:
         with open(path, "w", encoding="utf-8") as target:
             target.write("reviewer mutation\n")
     except OSError:
         failures.append(path)
+# A fingerprint taken after review cannot catch a temporary edit followed by restoration.
+# Opening the checkpoint read/write must fail before either operation can happen.
+try:
+    with open(checkpoint, "r+", encoding="utf-8") as target:
+        original = target.read()
+        target.seek(0)
+        target.write("temporary mutation\n")
+        target.seek(0)
+        target.write(original)
+        target.truncate()
+except OSError:
+    failures.append("temporary-mutation-and-restoration")
+scratch = os.path.join(os.environ["TMPDIR"], "review-scratch")
+with open(scratch, "w", encoding="utf-8") as target:
+    target.write("ephemeral\n")
 print(json.dumps({"type":"message_end","message":{"content":"attempted mutations"}}), flush=True)
 print(json.dumps({"type":"agent_settled"}), flush=True)
 assessment = json.loads(sys.stdin.readline())
 assert assessment["id"] == "review-assessment"
-result = {"mutation_attempts": 2, "blocked": len(failures)}
+result = {"mutation_attempts": 3, "blocked": len(failures), "private_scratch": os.path.isfile(scratch)}
 print(json.dumps({"type":"message_end","message":{"content":json.dumps(result)}}), flush=True)
 print(json.dumps({"type":"agent_settled"}), flush=True)
 "#,
@@ -658,13 +674,27 @@ print(json.dumps({"type":"agent_settled"}), flush=True)
 
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&output.text).unwrap(),
-        json!({"mutation_attempts": 2, "blocked": 2})
+        json!({"mutation_attempts": 3, "blocked": 3, "private_scratch": true})
     );
     assert_eq!(
         tokio::fs::read_to_string(&checkpoint_file).await.unwrap(),
         "checkpoint\n"
     );
     assert!(!host_tmp_marker.exists());
+    let scratch_mountpoint = dir
+        .join("state/sandboxes")
+        .join(&operation_id.0)
+        .join("tmp-run_review_sandbox");
+    assert!(
+        tokio::fs::read_dir(scratch_mountpoint)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none(),
+        "review scratch writes must disappear with the private tmpfs"
+    );
     let _ = tokio::fs::remove_dir_all(dir).await;
 }
 
