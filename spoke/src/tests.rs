@@ -167,8 +167,17 @@ fn observed_check(subject: &str, output: &str) -> ObservedReviewEvidence {
     ObservedReviewEvidence {
         evidence_id: "sha256:observed".into(),
         tool_call_id: "call-observed".into(),
-        tool_name: "bash".into(),
+        tool_name: if subject.ends_with(".md") {
+            "read".into()
+        } else {
+            "bash".into()
+        },
         subject: subject.into(),
+        args: if subject.ends_with(".md") {
+            json!({"path": subject})
+        } else {
+            json!({"command": subject})
+        },
         output_lines: vec![output.into()],
         successful: true,
         observed_at: now(),
@@ -187,14 +196,26 @@ fn promotion_requires_canonical_coverage_revision_reality_and_observed_evidence(
             content: "# Intent".into(),
         }],
     };
+    let obligation = ReviewObligation {
+        obligation_id: "obligation-test".into(),
+        kind: ReviewObligationKind::ValidationCommand,
+        subject: "cargo test --workspace".into(),
+        expected_content_hash: None,
+        validation_area: Some("workspace tests".into()),
+    };
+    let obligations = vec![obligation];
     let review = ReviewRunResult {
         source_coverage: source_bundle::coverage(&bundle),
         target_revision: 3,
         observed_reality_version: "reality-3".into(),
         scope: ReviewScope::WholeProject,
-        reviewed_scope: vec!["all project files and required behavior".into()],
+        reviewed_scope: vec!["obligation-test".into()],
         checks: vec!["cargo test --workspace".into()],
-        evidence: vec!["workspace suite passed".into()],
+        evidence: vec!["sha256:observed".into()],
+        obligation_observations: vec![ReviewObligationObservation {
+            obligation_id: "obligation-test".into(),
+            evidence_id: "sha256:observed".into(),
+        }],
         findings: vec![],
         unreviewed_required_scope: vec![],
         verdict: ReviewVerdict::Approved,
@@ -205,27 +226,57 @@ fn promotion_requires_canonical_coverage_revision_reality_and_observed_evidence(
         "workspace suite passed",
     )];
     assert!(
-        validate_review_for_promotion(&review, 3, "reality-3", Some(&bundle), &observed).is_ok()
+        validate_review_for_promotion(
+            &review,
+            3,
+            "reality-3",
+            Some(&bundle),
+            &obligations,
+            &observed
+        )
+        .is_ok()
     );
 
     let mut stale = review.clone();
     stale.target_revision = 2;
     assert!(
-        validate_review_for_promotion(&stale, 3, "reality-3", Some(&bundle), &observed).is_err()
+        validate_review_for_promotion(
+            &stale,
+            3,
+            "reality-3",
+            Some(&bundle),
+            &obligations,
+            &observed
+        )
+        .is_err()
     );
 
     let mut wrong_reality = review.clone();
     wrong_reality.observed_reality_version = "model-claimed-reality".into();
     assert!(
-        validate_review_for_promotion(&wrong_reality, 3, "reality-3", Some(&bundle), &observed,)
-            .is_err()
+        validate_review_for_promotion(
+            &wrong_reality,
+            3,
+            "reality-3",
+            Some(&bundle),
+            &obligations,
+            &observed,
+        )
+        .is_err()
     );
 
     let mut incomplete = review;
     incomplete.source_coverage.clear();
     assert!(
-        validate_review_for_promotion(&incomplete, 3, "reality-3", Some(&bundle), &observed)
-            .is_err()
+        validate_review_for_promotion(
+            &incomplete,
+            3,
+            "reality-3",
+            Some(&bundle),
+            &obligations,
+            &observed
+        )
+        .is_err()
     );
 }
 
@@ -239,18 +290,141 @@ fn fabricated_nonempty_review_prose_cannot_approve() {
         reviewed_scope: vec!["complete project".into()],
         checks: vec!["tests passed".into()],
         evidence: vec!["evidence exists".into()],
+        obligation_observations: vec![ReviewObligationObservation {
+            obligation_id: "invented".into(),
+            evidence_id: "evidence exists".into(),
+        }],
         findings: vec![],
         unreviewed_required_scope: vec![],
         verdict: ReviewVerdict::Approved,
     };
 
-    let error = validate_review_for_promotion(&review, 1, "reality", None, &[])
+    let obligation = ReviewObligation {
+        obligation_id: "required-read".into(),
+        kind: ReviewObligationKind::ProjectFile,
+        subject: "README.md".into(),
+        expected_content_hash: Some("canonical".into()),
+        validation_area: None,
+    };
+    let obligations = vec![obligation];
+    let error = validate_review_for_promotion(&review, 1, "reality", None, &obligations, &[])
         .unwrap_err()
         .to_string();
-    assert!(error.contains("not bound to a successful Spoke-observed tool result"));
+    assert!(error.contains("map one-to-one") || error.contains("reviewed_scope"));
 
-    let unrelated = vec![observed_check("cargo test --workspace", "all tests passed")];
-    assert!(validate_review_for_promotion(&review, 1, "reality", None, &unrelated).is_err());
+    let unrelated = vec![observed_check("tests passed", "evidence exists")];
+    assert!(
+        validate_review_for_promotion(&review, 1, "reality", None, &obligations, &unrelated)
+            .is_err()
+    );
+}
+
+#[test]
+fn copied_coverage_and_one_trivial_read_cannot_approve_complete_scope() {
+    let bundle = SourceOfIntentBundle {
+        manifest_path: "design.md".into(),
+        bundle_hash: "bundle".into(),
+        documents: vec![SourceDocument {
+            path: "design.md".into(),
+            content_hash: "canonical-hash".into(),
+            byte_len: 7,
+            content: "# Intent".into(),
+        }],
+    };
+    let obligations = vec![
+        ReviewObligation {
+            obligation_id: "read-design".into(),
+            kind: ReviewObligationKind::AuthoritativeDocument,
+            subject: "design.md".into(),
+            expected_content_hash: Some("canonical-hash".into()),
+            validation_area: None,
+        },
+        ReviewObligation {
+            obligation_id: "workspace-tests".into(),
+            kind: ReviewObligationKind::ValidationCommand,
+            subject: "cargo test --workspace --all-targets".into(),
+            expected_content_hash: None,
+            validation_area: Some("workspace tests".into()),
+        },
+    ];
+    let copied_observation = observed_check("design.md", "# Intent");
+    let review = ReviewRunResult {
+        source_coverage: source_bundle::coverage(&bundle),
+        target_revision: 3,
+        observed_reality_version: "reality".into(),
+        scope: ReviewScope::WholeProject,
+        reviewed_scope: vec!["read-design".into(), "workspace-tests".into()],
+        checks: vec![
+            "design.md".into(),
+            "cargo test --workspace --all-targets".into(),
+        ],
+        evidence: vec![
+            copied_observation.evidence_id.clone(),
+            "sha256:invented".into(),
+        ],
+        obligation_observations: vec![
+            ReviewObligationObservation {
+                obligation_id: "read-design".into(),
+                evidence_id: copied_observation.evidence_id.clone(),
+            },
+            ReviewObligationObservation {
+                obligation_id: "workspace-tests".into(),
+                evidence_id: "sha256:invented".into(),
+            },
+        ],
+        findings: vec![],
+        unreviewed_required_scope: vec![],
+        verdict: ReviewVerdict::Approved,
+    };
+
+    let error = validate_review_for_promotion(
+        &review,
+        3,
+        "reality",
+        Some(&bundle),
+        &obligations,
+        &[copied_observation],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not bound to a successful Spoke-observed tool result"));
+}
+
+#[test]
+fn spoke_issues_file_and_validation_obligations_from_reality() {
+    let dir = std::env::temp_dir().join(format!("pumpkinpi-obligations-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("design.md"), "# Intent\n").unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(dir.join("README.md"), "project\n").unwrap();
+    let bundle = SourceOfIntentBundle {
+        manifest_path: "design.md".into(),
+        bundle_hash: "bundle".into(),
+        documents: vec![SourceDocument {
+            path: "design.md".into(),
+            content_hash: hex::encode(Sha256::digest(b"# Intent\n")),
+            byte_len: 9,
+            content: "# Intent\n".into(),
+        }],
+    };
+
+    let obligations = issue_review_obligations(&dir, Some(&bundle), 3, "reality").unwrap();
+    assert!(obligations.iter().any(|item| {
+        item.kind == ReviewObligationKind::AuthoritativeDocument && item.subject == "design.md"
+    }));
+    for path in ["Cargo.toml", "README.md"] {
+        assert!(obligations.iter().any(|item| {
+            item.kind == ReviewObligationKind::ProjectFile && item.subject == path
+        }));
+    }
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|item| item.kind == ReviewObligationKind::ValidationCommand)
+            .count(),
+        3
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -291,6 +465,77 @@ async fn active_intent_iterates_through_independent_review_to_satisfaction() {
     }
     let coverage_json =
         serde_json::to_string(&source_bundle::coverage(&authoritative_bundle)).unwrap();
+    let fixture_reality = project_fingerprint(project_root.clone()).await.unwrap();
+    let fixture_obligations = issue_review_obligations(
+        &project_root,
+        Some(&authoritative_bundle),
+        1,
+        &fixture_reality,
+    )
+    .unwrap();
+    let mut fixture_events = Vec::new();
+    let mut fixture_bindings = Vec::new();
+    for (index, obligation) in fixture_obligations.iter().enumerate() {
+        let tool_call_id = format!("fixture-call-{index}");
+        let (tool_name, args, text) = match obligation.kind {
+            ReviewObligationKind::AuthoritativeDocument | ReviewObligationKind::ProjectFile => (
+                "read",
+                json!({"path": obligation.subject}),
+                std::fs::read_to_string(project_root.join(&obligation.subject)).unwrap(),
+            ),
+            ReviewObligationKind::ValidationCommand => (
+                "bash",
+                json!({"command": obligation.subject}),
+                "validation passed\n".into(),
+            ),
+        };
+        fixture_events.push(json!({
+            "type": "tool_execution_start",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "args": args,
+        }));
+        let end = json!({
+            "type": "tool_execution_end",
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "result": {"content": [{"type": "text", "text": text}]},
+            "isError": false,
+        });
+        let observation = observed_review_evidence(&end, tool_name.into(), args).unwrap();
+        fixture_bindings.push(ReviewObligationObservation {
+            obligation_id: obligation.obligation_id.clone(),
+            evidence_id: observation.evidence_id,
+        });
+        fixture_events.push(end);
+    }
+    let fixture_event_lines = fixture_events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixture_scope = serde_json::to_string(
+        &fixture_obligations
+            .iter()
+            .map(|item| &item.obligation_id)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let fixture_checks = serde_json::to_string(
+        &fixture_obligations
+            .iter()
+            .map(|item| &item.subject)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let fixture_evidence = serde_json::to_string(
+        &fixture_bindings
+            .iter()
+            .map(|item| &item.evidence_id)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let fixture_bindings = serde_json::to_string(&fixture_bindings).unwrap();
 
     let fake_pi = dir.join("fake-pi");
     let script = r####"#!/bin/sh
@@ -301,9 +546,8 @@ case "$request" in
     ;;
   *"independent whole-Project reviewer"*)
     reality=$(printf '%s' "$request" | sed -n 's/.*observed_reality_version [^0-9a-f]*\([0-9a-f]\{64\}\).*/\1/p')
-    printf '%s\n' '{"type":"tool_execution_start","toolCallId":"call_review","toolName":"bash","args":{"command":"printf fixture-observed"}}'
-    printf '%s\n' '{"type":"tool_execution_end","toolCallId":"call_review","toolName":"bash","result":{"content":[{"type":"text","text":"fixture-observed\n"}]},"isError":false}'
-    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":["complete project"],"checks":["printf fixture-observed"],"evidence":["fixture-observed"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
+    printf '%s\n' '__REVIEW_EVENTS__'
+    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":__REVIEW_SCOPE__,"checks":__REVIEW_CHECKS__,"evidence":__REVIEW_EVIDENCE__,"obligation_observations":__REVIEW_BINDINGS__,"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
     ;;
   *)
     result='{"source_coverage":__COVERAGE__,"objective":"verify fixture","summary":"Fixture conforms.","observations":["README exists"],"changes":[],"validation":["fixture inspected"],"evidence":["README.md"],"residual_divergence":[],"question":null}'
@@ -313,7 +557,13 @@ escaped=$(printf '%s' "$result" | sed 's/\\/\\\\/g; s/"/\\"/g')
 printf '%s\n' "{\"type\":\"message_end\",\"message\":{\"content\":\"$escaped\"}}"
 printf '%s\n' '{"type":"agent_settled"}'
 "####;
-    let script = script.replace("__COVERAGE__", &coverage_json);
+    let script = script
+        .replace("__COVERAGE__", &coverage_json)
+        .replace("__REVIEW_EVENTS__", &fixture_event_lines)
+        .replace("__REVIEW_SCOPE__", &fixture_scope)
+        .replace("__REVIEW_CHECKS__", &fixture_checks)
+        .replace("__REVIEW_EVIDENCE__", &fixture_evidence)
+        .replace("__REVIEW_BINDINGS__", &fixture_bindings);
     tokio::fs::write(&fake_pi, script).await.unwrap();
     #[cfg(unix)]
     {

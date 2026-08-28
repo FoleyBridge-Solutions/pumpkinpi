@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 pub const PROTOCOL_VERSION: u32 = 3;
 pub fn protocol_version() -> u32 {
@@ -373,6 +376,12 @@ pub struct ReviewRecord {
     pub reviewed_scope: Vec<String>,
     pub checks: Vec<String>,
     pub evidence: Vec<String>,
+    /// Scope requirements issued by the Spoke before the independent Run began.
+    #[serde(default)]
+    pub obligations: Vec<ReviewObligation>,
+    /// One independently captured tool observation satisfying each issued obligation.
+    #[serde(default)]
+    pub obligation_observations: Vec<ReviewObligationObservation>,
     pub findings: Vec<ReviewFinding>,
     pub unreviewed_required_scope: Vec<String>,
     pub verdict: ReviewVerdict,
@@ -691,6 +700,34 @@ pub struct ImplementationRunResult {
     pub question: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewObligationKind {
+    AuthoritativeDocument,
+    ProjectFile,
+    ValidationCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewObligation {
+    pub obligation_id: String,
+    pub kind: ReviewObligationKind,
+    /// Exact read path or bash command the Spoke requires the reviewer to execute.
+    pub subject: String,
+    /// Content hash fixed before review for file obligations.
+    pub expected_content_hash: Option<String>,
+    pub validation_area: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewObligationObservation {
+    pub obligation_id: String,
+    /// Durable ID of the successful tool event captured independently by the Spoke.
+    pub evidence_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewRunResult {
@@ -701,6 +738,7 @@ pub struct ReviewRunResult {
     pub reviewed_scope: Vec<String>,
     pub checks: Vec<String>,
     pub evidence: Vec<String>,
+    pub obligation_observations: Vec<ReviewObligationObservation>,
     pub findings: Vec<ReviewFindingProposal>,
     pub unreviewed_required_scope: Vec<String>,
     pub verdict: ReviewVerdict,
@@ -741,8 +779,36 @@ impl ReviewRunResult {
             ReviewVerdict::Approved if self.reviewed_scope.is_empty() => {
                 Err("approval requires explicit reviewed scope")
             }
-            ReviewVerdict::Approved if self.checks.is_empty() || self.evidence.is_empty() => {
-                Err("approval requires checks and supporting evidence")
+            ReviewVerdict::Approved
+                if self.checks.is_empty()
+                    || self.evidence.is_empty()
+                    || self.obligation_observations.is_empty() =>
+            {
+                Err("approval requires checks and Spoke-bound supporting observations")
+            }
+            ReviewVerdict::Approved => {
+                let scope = self.reviewed_scope.iter().collect::<BTreeSet<_>>();
+                let obligation_ids = self
+                    .obligation_observations
+                    .iter()
+                    .map(|item| &item.obligation_id)
+                    .collect::<BTreeSet<_>>();
+                let evidence = self.evidence.iter().collect::<BTreeSet<_>>();
+                let observation_evidence = self
+                    .obligation_observations
+                    .iter()
+                    .map(|item| &item.evidence_id)
+                    .collect::<BTreeSet<_>>();
+                if scope != obligation_ids
+                    || evidence != observation_evidence
+                    || scope.len() != self.obligation_observations.len()
+                    || evidence.len() != self.obligation_observations.len()
+                    || self.checks.len() != self.obligation_observations.len()
+                {
+                    Err("approval scope, checks, and evidence must map one-to-one to obligations")
+                } else {
+                    Ok(())
+                }
             }
             ReviewVerdict::Findings if self.findings.is_empty() => {
                 Err("findings verdict requires at least one finding")

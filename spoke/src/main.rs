@@ -94,6 +94,7 @@ struct ObservedReviewEvidence {
     tool_call_id: String,
     tool_name: String,
     subject: String,
+    args: serde_json::Value,
     output_lines: Vec<String>,
     successful: bool,
     observed_at: u64,
@@ -1327,12 +1328,19 @@ async fn run_operation(
 
         set_realization_status(&state, &pid, RealizationStatus::Reviewing).await?;
         let before_review = project_fingerprint(PathBuf::from(&execution_project.cwd)).await?;
+        let review_obligations = issue_review_obligations(
+            Path::new(&execution_project.cwd),
+            current_source.authoritative_bundle.as_ref(),
+            machine.revision,
+            &before_review,
+        )?;
         let prompt = orchestrator::review_prompt(
             machine.revision,
             &before_review,
             &current_source.canonical_payload,
             &implementation,
             &authoritative_manifest,
+            &review_obligations,
         );
         let (review_run_id, raw, review_evidence) = run_internal(
             &state,
@@ -1372,6 +1380,7 @@ async fn run_operation(
             machine.revision,
             Path::new(&execution_project.cwd),
             &before_review,
+            &review_obligations,
             &review_evidence,
             &review,
         )
@@ -1514,6 +1523,7 @@ fn validate_review_for_promotion(
     revision: u64,
     observed_reality_version: &str,
     authoritative_bundle: Option<&SourceOfIntentBundle>,
+    obligations: &[ReviewObligation],
     observed_evidence: &[ObservedReviewEvidence],
 ) -> Result<()> {
     result.validate().map_err(anyhow::Error::msg)?;
@@ -1530,44 +1540,114 @@ fn validate_review_for_promotion(
     }
     source_bundle::validate_coverage(authoritative_bundle, &result.source_coverage)?;
     if result.verdict == ReviewVerdict::Approved {
-        corroborate_approval(result, observed_evidence)?;
+        corroborate_approval(result, obligations, observed_evidence)?;
     }
     Ok(())
 }
 
 fn corroborate_approval(
     result: &ReviewRunResult,
+    obligations: &[ReviewObligation],
     observed: &[ObservedReviewEvidence],
 ) -> Result<()> {
-    let mut checked = BTreeSet::new();
-    for check in &result.checks {
-        let matches = observed
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.successful && item.subject == *check)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            return Err(anyhow!(
-                "approval check is not bound to a successful Spoke-observed tool result: {check}"
-            ));
-        }
-        checked.extend(matches);
+    let required_ids = obligations
+        .iter()
+        .map(|item| item.obligation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let reviewed_ids = result
+        .reviewed_scope
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if reviewed_ids != required_ids || result.reviewed_scope.len() != obligations.len() {
+        return Err(anyhow!(
+            "approval reviewed_scope does not exactly cover the Spoke-issued obligations; required={required_ids:?}, reported={reviewed_ids:?}"
+        ));
     }
-    for claim in &result.evidence {
-        let supported = checked.iter().any(|index| {
-            let item = &observed[*index];
-            item.evidence_id == *claim || item.output_lines.iter().any(|line| line == claim)
-        });
-        if !supported {
+
+    let mut reported = BTreeMap::new();
+    for binding in &result.obligation_observations {
+        if reported
+            .insert(binding.obligation_id.clone(), binding.evidence_id.clone())
+            .is_some()
+        {
+            return Err(anyhow!("duplicate review obligation observation"));
+        }
+    }
+    if reported.keys().cloned().collect::<BTreeSet<_>>() != required_ids {
+        return Err(anyhow!(
+            "approval does not bind every Spoke-issued obligation to an observation"
+        ));
+    }
+
+    let mut used_evidence = BTreeSet::new();
+    for obligation in obligations {
+        let evidence_id = &reported[&obligation.obligation_id];
+        if !used_evidence.insert(evidence_id.clone()) {
             return Err(anyhow!(
-                "approval evidence is not present in a Spoke-observed result for a listed check: {claim}"
+                "each review obligation requires an independently captured observation"
             ));
         }
+        let item = observed
+            .iter()
+            .find(|item| item.successful && item.evidence_id == *evidence_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "review obligation is not bound to a successful Spoke-observed tool result: {}",
+                    obligation.obligation_id
+                )
+            })?;
+        if item.subject != obligation.subject {
+            return Err(anyhow!(
+                "review obligation observation has the wrong subject"
+            ));
+        }
+        match obligation.kind {
+            ReviewObligationKind::AuthoritativeDocument | ReviewObligationKind::ProjectFile => {
+                let full_read = item.tool_name == "read"
+                    && item.args.get("path").and_then(|value| value.as_str())
+                        == Some(obligation.subject.as_str())
+                    && item
+                        .args
+                        .get("offset")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(1)
+                        == 1
+                    && item.args.get("limit").is_none();
+                if !full_read {
+                    return Err(anyhow!(
+                        "file review obligation requires a successful unbounded read from line 1: {}",
+                        obligation.subject
+                    ));
+                }
+            }
+            ReviewObligationKind::ValidationCommand if item.tool_name != "bash" => {
+                return Err(anyhow!(
+                    "validation obligation requires its exact bash command"
+                ));
+            }
+            ReviewObligationKind::ValidationCommand => {}
+        }
+    }
+
+    let expected_checks = obligations
+        .iter()
+        .map(|item| item.subject.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_evidence = reported.values().cloned().collect::<BTreeSet<_>>();
+    if result.checks.iter().cloned().collect::<BTreeSet<_>>() != expected_checks
+        || result.checks.len() != obligations.len()
+        || result.evidence.iter().cloned().collect::<BTreeSet<_>>() != expected_evidence
+        || result.evidence.len() != obligations.len()
+    {
+        return Err(anyhow!(
+            "approval checks and evidence must exactly represent issued obligations"
+        ));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_review(
     state: &State,
     project_id: &ProjectId,
@@ -1575,6 +1655,7 @@ async fn persist_review(
     revision: u64,
     observed_cwd: &Path,
     expected_fingerprint: &str,
+    obligations: &[ReviewObligation],
     observed_evidence: &[ObservedReviewEvidence],
     result: &ReviewRunResult,
 ) -> Result<ReviewRecord> {
@@ -1596,6 +1677,7 @@ async fn persist_review(
         revision,
         &observed_content_hash,
         source.authoritative_bundle.as_ref(),
+        obligations,
         observed_evidence,
     )?;
     let record = ReviewRecord {
@@ -1609,6 +1691,8 @@ async fn persist_review(
         reviewed_scope: result.reviewed_scope.clone(),
         checks: result.checks.clone(),
         evidence: result.evidence.clone(),
+        obligations: obligations.to_vec(),
+        obligation_observations: result.obligation_observations.clone(),
         findings: result
             .findings
             .iter()
@@ -1715,6 +1799,119 @@ async fn project_fingerprint(root: PathBuf) -> Result<String> {
     .await
     .context("project fingerprint task failed")?
     .context("project fingerprint failed")
+}
+
+fn issue_review_obligations(
+    root: &Path,
+    bundle: Option<&SourceOfIntentBundle>,
+    revision: u64,
+    reality: &str,
+) -> Result<Vec<ReviewObligation>> {
+    fn visit(root: &Path, path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let name = entry.file_name();
+            if file_type.is_dir() {
+                if name != ".git" && name != "target" {
+                    visit(root, &entry.path(), files)?;
+                }
+            } else if file_type.is_file() && name != ".git" {
+                files.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    fn obligation(
+        kind: ReviewObligationKind,
+        subject: String,
+        expected_content_hash: Option<String>,
+        validation_area: Option<String>,
+        revision: u64,
+        _reality: &str,
+    ) -> ReviewObligation {
+        let identity = json!({
+            "kind": kind,
+            "subject": subject,
+            "expected_content_hash": expected_content_hash,
+            "validation_area": validation_area,
+            "revision": revision,
+        });
+        ReviewObligation {
+            obligation_id: format!(
+                "review-obligation:{}",
+                hex::encode(Sha256::digest(identity.to_string()))
+            ),
+            kind,
+            subject,
+            expected_content_hash,
+            validation_area,
+        }
+    }
+
+    let authoritative_paths = bundle
+        .map(|bundle| {
+            bundle
+                .documents
+                .iter()
+                .map(|document| document.path.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut obligations = bundle
+        .into_iter()
+        .flat_map(|bundle| &bundle.documents)
+        .map(|document| {
+            obligation(
+                ReviewObligationKind::AuthoritativeDocument,
+                document.path.clone(),
+                Some(document.content_hash.clone()),
+                None,
+                revision,
+                reality,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    for relative in files {
+        let subject = relative.to_string_lossy().replace('\\', "/");
+        if authoritative_paths.contains(&subject) {
+            continue;
+        }
+        let hash = hex::encode(Sha256::digest(std::fs::read(root.join(&relative))?));
+        obligations.push(obligation(
+            ReviewObligationKind::ProjectFile,
+            subject,
+            Some(hash),
+            None,
+            revision,
+            reality,
+        ));
+    }
+
+    if root.join("Cargo.toml").is_file() {
+        for (area, command) in [
+            ("workspace tests", "cargo test --workspace --all-targets"),
+            (
+                "warning-free static analysis",
+                "cargo clippy --workspace --all-targets -- -D warnings",
+            ),
+            ("formatting", "cargo fmt --all -- --check"),
+        ] {
+            obligations.push(obligation(
+                ReviewObligationKind::ValidationCommand,
+                command.into(),
+                None,
+                Some(area.into()),
+                revision,
+                reality,
+            ));
+        }
+    }
+    Ok(obligations)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2019,6 +2216,7 @@ fn observed_review_evidence(
         tool_call_id,
         tool_name,
         subject,
+        args,
         output_lines,
         successful: !event
             .get("isError")

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use pumpkinpi_protocol::{
-    ImplementationRunResult, IntentTurnProposal, ReviewFindingProposal, ReviewRunResult,
-    ReviewVerdict,
+    ImplementationRunResult, IntentTurnProposal, ReviewFindingProposal, ReviewObligation,
+    ReviewRunResult, ReviewVerdict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -165,9 +165,11 @@ pub(crate) fn review_prompt(
     source: &str,
     implementation: &ImplementationRunResult,
     authoritative_manifest: &str,
+    obligations: &[ReviewObligation],
 ) -> String {
     let implementation =
         serde_json::to_string_pretty(implementation).unwrap_or_else(|_| "{}".into());
+    let obligations = serde_json::to_string_pretty(obligations).unwrap_or_else(|_| "[]".into());
     format!(
         r#"You are PumpkinPi's independent whole-Project reviewer. You did not implement this iteration. Inspect the complete current project using read-only tools and assess it against every applicable part of the complete Source of Intent, not only the latest diff.
 
@@ -176,11 +178,14 @@ Find every fault you can: omissions, incorrect behavior, architecture violations
 Read and hash every document in the authoritative bundle before review. Return exact path/hash pairs in source_coverage. Missing or changed coverage prohibits approval.
 
 Return ONLY one JSON object with this schema:
-{{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
+{{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"obligation_observations":[{{"obligation_id":string,"evidence_id":string}}],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
 
-For an approval, every checks entry must be the exact command string of a successful bash tool call or exact path of a successful read tool call performed during this review. Every evidence entry must be either an exact nonempty output line from one of those listed checks or its durable sha256 evidence ID. The Spoke captures tool start/end events, independently corroborates these bindings, and durably stores the observations; unsupported prose is rejected. Findings may continue to cite descriptive evidence.
+The Spoke issued the obligations below before this Run. For approval, perform every exact required read or command. A file obligation requires an unbounded read from line 1. Put every obligation_id exactly once in reviewed_scope; put every exact obligation subject in checks; put every captured durable sha256 evidence ID in evidence; and map each obligation to its own successful event in obligation_observations. One event cannot satisfy multiple obligations. Output text, copied coverage, arbitrary scope prose, partial reads, and unissued checks cannot establish approval. Findings may continue to cite descriptive evidence.
 
-Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, unchanged Project reality, and observed check evidence. Use verdict "approved" only when scope is whole_project, reviewed_scope, checks, and evidence are nonempty, findings and unreviewed_required_scope are empty, and the corroborated evidence supports finding no fault in Project reality against this entire intent revision.
+Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, unchanged Project reality, and complete obligation evidence. Use verdict "approved" only when every issued obligation is satisfied, findings and unreviewed_required_scope are empty, and the corroborated evidence supports finding no fault in Project reality against this entire intent revision.
+
+SPOKE-ISSUED REVIEW OBLIGATIONS:
+{obligations}
 
 SOURCE OF INTENT revision {revision}:
 {source}
@@ -224,6 +229,7 @@ mod tests {
                 reviewed_scope: vec!["workspace".into()],
                 checks: vec![],
                 evidence: vec![],
+                obligation_observations: vec![],
                 findings: vec![ReviewFindingProposal {
                     requirement: "durable replay".into(),
                     fault: "restart loses cursor".into(),
@@ -249,9 +255,13 @@ mod tests {
                 target_revision: 4,
                 observed_reality_version: "reality-1".into(),
                 scope: pumpkinpi_protocol::ReviewScope::WholeProject,
-                reviewed_scope: vec!["complete project".into()],
+                reviewed_scope: vec!["workspace".into()],
                 checks: vec!["cargo test --workspace".into()],
                 evidence: vec!["workspace test output: passed".into()],
+                obligation_observations: vec![pumpkinpi_protocol::ReviewObligationObservation {
+                    obligation_id: "workspace".into(),
+                    evidence_id: "workspace test output: passed".into(),
+                }],
                 findings: vec![],
                 unreviewed_required_scope: vec![],
                 verdict: ReviewVerdict::Approved,
@@ -274,6 +284,7 @@ mod tests {
                     reviewed_scope: vec!["complete project".into()],
                     checks: vec![],
                     evidence: vec![],
+                    obligation_observations: vec![],
                     findings: vec![ReviewFindingProposal {
                         requirement: "still exact".into(),
                         fault: format!("fault {expected_iteration}"),
