@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RealizationPhase {
     Implementing,
+    /// Retained for storage compatibility with pre-convergence realization records.
+    Validating,
+    /// Retained for storage compatibility with pre-convergence realization records.
+    ValidationBlocked,
     Reviewing,
     WaitingForUser,
     Satisfied,
