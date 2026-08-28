@@ -85,6 +85,12 @@ struct PendingMessage {
 }
 
 #[derive(Debug, Clone)]
+struct DiagnosticView {
+    message: String,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone)]
 struct InteractionView {
     spoke_id: SpokeId,
     project_id: ProjectId,
@@ -107,7 +113,7 @@ struct UiState {
     pending_messages: Vec<PendingMessage>,
     interactions: Vec<InteractionView>,
     path_suggestions: BTreeMap<SpokeId, Vec<String>>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<DiagnosticView>,
 }
 
 struct AppStore {
@@ -121,7 +127,7 @@ struct AppStore {
     pending_messages: Vec<PendingMessage>,
     interactions: BTreeMap<(OperationId, String), InteractionView>,
     path_suggestions: BTreeMap<SpokeId, Vec<String>>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<DiagnosticView>,
     pending_local_project: Option<(String, Option<String>)>,
 }
 
@@ -166,7 +172,15 @@ impl AppStore {
     }
 
     fn diagnostic(&mut self, message: impl Into<String>) {
-        self.diagnostics.push(message.into());
+        let created_at = Utc::now().timestamp().try_into().unwrap_or_default();
+        self.diagnostic_at(created_at, message);
+    }
+
+    fn diagnostic_at(&mut self, created_at: u64, message: impl Into<String>) {
+        self.diagnostics.push(DiagnosticView {
+            message: message.into(),
+            created_at,
+        });
         if self.diagnostics.len() > 500 {
             self.diagnostics.drain(..100);
         }
@@ -410,6 +424,7 @@ impl GuiRuntime {
     fn apply(&self, event: ClientEvent) {
         let mut store = self.store.lock().expect("store lock poisoned");
         let mut follow_up = None;
+        let event_created_at = event.created_at;
         match event.payload {
             ClientPayload::Authenticated => {}
             ClientPayload::SpokeList { spokes } => {
@@ -493,7 +508,6 @@ impl GuiRuntime {
                 request_id,
                 method,
                 payload,
-                created_at,
             } => {
                 let interaction = InteractionView {
                     spoke_id,
@@ -502,7 +516,7 @@ impl GuiRuntime {
                     request_id: request_id.clone(),
                     method,
                     payload,
-                    created_at,
+                    created_at: event_created_at,
                 };
                 store
                     .interactions
@@ -532,16 +546,22 @@ impl GuiRuntime {
             }
             ClientPayload::Projection {
                 revision, content, ..
-            } => store.diagnostic(format!("Intent projection r{revision}: {content}")),
+            } => store.diagnostic_at(
+                event_created_at,
+                format!("Intent projection r{revision}: {content}"),
+            ),
             ClientPayload::ReplayGap {
                 requested,
                 available,
                 ..
-            } => store.diagnostic(format!(
-                "Timeline replay gap: requested {requested}, earliest available {available}"
-            )),
+            } => store.diagnostic_at(
+                event_created_at,
+                format!(
+                    "Timeline replay gap: requested {requested}, earliest available {available}"
+                ),
+            ),
             ClientPayload::Error { code, message } => {
-                store.diagnostic(format!("{code}: {message}"));
+                store.diagnostic_at(event_created_at, format!("{code}: {message}"));
                 store.connection = ConnectionView {
                     kind: ConnectionKind::Degraded,
                     label: "Attention required".into(),
@@ -1342,8 +1362,11 @@ fn render_inspector(
                     if view.diagnostics.is_empty() {
                         div { class: "inspector-empty compact", "No diagnostics have been reported." }
                     }
-                    for (index, line) in view.diagnostics.iter().take(100).enumerate() {
-                        div { class: "diagnostic-line", key: "{index}", "{line}" }
+                    for (index, diagnostic) in view.diagnostics.iter().take(100).enumerate() {
+                        div { class: "diagnostic-line", key: "{index}",
+                            time { datetime: "{format_local_timestamp(diagnostic.created_at)}", "{format_local_timestamp(diagnostic.created_at)}" }
+                            span { "{diagnostic.message}" }
+                        }
                     }
                 }
             }
@@ -1368,11 +1391,15 @@ fn render_inspector(
                             let cancel_operation = operation.clone();
                             let status = enum_class(&operation.status);
                             let active = is_active(&operation.status);
+                            let timestamp = format_local_timestamp(operation.updated_at);
                             rsx! {
                                 div { class: "operation-row", key: "{operation.operation_id}",
                                     header {
                                         b { "{operation.kind}" }
-                                        span { class: "operation-state {status}", "{status}" }
+                                        div { class: "operation-meta",
+                                            time { datetime: "{timestamp}", "{timestamp}" }
+                                            span { class: "operation-state {status}", "{status}" }
+                                        }
                                     }
                                     p { class: "operation-id", "{operation.operation_id}" }
                                     if let Some(error) = &operation.error {

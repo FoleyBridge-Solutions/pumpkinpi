@@ -462,6 +462,7 @@ async fn handle_client(socket: WebSocket, app: App) {
             .send(text_event(ClientEvent {
                 protocol_version: PROTOCOL_VERSION,
                 id: None,
+                created_at: now(),
                 payload: ClientPayload::Error {
                     code: "authentication_failed".into(),
                     message: "invalid owner credential".into(),
@@ -486,6 +487,7 @@ async fn handle_client(socket: WebSocket, app: App) {
         ClientEvent {
             protocol_version: PROTOCOL_VERSION,
             id: None,
+            created_at: now(),
             payload: ClientPayload::Authenticated,
         },
     )
@@ -521,6 +523,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::HubStatus {
                         version: env!("CARGO_PKG_VERSION").into(),
                     },
@@ -543,6 +546,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::SpokeList { spokes },
                 },
             )
@@ -562,6 +566,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::ProjectList { projects },
                 },
             )
@@ -583,6 +588,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::ProviderList { accounts },
                 },
             )
@@ -614,6 +620,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::ProviderList { accounts },
                 },
             )
@@ -643,6 +650,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: Some(req.id),
+                    created_at: now(),
                     payload: ClientPayload::ProviderList { accounts },
                 },
             )
@@ -704,6 +712,7 @@ async fn route_client(app: &App, cid: &str, req: ClientRequest) -> Result<()> {
                     ClientEvent {
                         protocol_version: PROTOCOL_VERSION,
                         id: Some(req.id),
+                        created_at: now(),
                         payload: ClientPayload::ProjectSnapshot {
                             snapshot: Box::new(cached),
                         },
@@ -905,6 +914,7 @@ async fn broadcast_spoke(app: &App, id: &SpokeId) {
                 ClientEvent {
                     protocol_version: PROTOCOL_VERSION,
                     id: None,
+                    created_at: now(),
                     payload: ClientPayload::SpokeUpdated {
                         spoke: spoke.clone(),
                     },
@@ -921,6 +931,7 @@ async fn send_error(app: &App, c: &str, id: Option<RequestId>, code: &str, msg: 
         ClientEvent {
             protocol_version: PROTOCOL_VERSION,
             id,
+            created_at: now(),
             payload: ClientPayload::Error {
                 code: code.into(),
                 message: msg.into(),

@@ -412,6 +412,7 @@ fn event(id: Option<RequestId>, payload: ClientPayload) -> SpokeToHub {
         event: Box::new(ClientEvent {
             protocol_version: PROTOCOL_VERSION,
             id,
+            created_at: now(),
             payload,
         }),
     }
@@ -1828,7 +1829,7 @@ async fn run_pi(
                         let (answer_tx, answer_rx) = oneshot::channel();
                         state.interactions.lock().await.insert((operation.clone(), request_id.clone()), answer_tx);
                         update_operation(state, tx, operation, OperationStatus::Blocked, None).await?;
-                        tx.send(event(None, ClientPayload::Interaction { spoke_id: project.spoke_id.clone(), project_id: project.project_id.clone(), operation_id: operation.clone(), request_id: request_id.clone(), method: method.clone(), payload: v.clone(), created_at: now() }))?;
+                        tx.send(event(None, ClientPayload::Interaction { spoke_id: project.spoke_id.clone(), project_id: project.project_id.clone(), operation_id: operation.clone(), request_id: request_id.clone(), method: method.clone(), payload: v.clone() }))?;
                         let response = tokio::select! {
                             answer = answer_rx => answer.context("interaction response channel closed")?,
                             changed = cancel.changed() => { let _ = changed; state.interactions.lock().await.remove(&(operation.clone(), request_id.clone())); let _ = child.kill().await; return Err(anyhow!("operation cancelled while awaiting interaction")); }
@@ -1840,7 +1841,7 @@ async fn run_pi(
                         stdin.flush().await?;
                         update_operation(state, tx, operation, OperationStatus::Running, None).await?;
                     } else {
-                        tx.send(event(None, ClientPayload::Interaction { spoke_id: project.spoke_id.clone(), project_id: project.project_id.clone(), operation_id: operation.clone(), request_id, method, payload: v.clone(), created_at: now() }))?;
+                        tx.send(event(None, ClientPayload::Interaction { spoke_id: project.spoke_id.clone(), project_id: project.project_id.clone(), operation_id: operation.clone(), request_id, method, payload: v.clone() }))?;
                     }
                 }
                 if event_type == "message_end" && let Some(t) = message_content(&v) { final_text = t }

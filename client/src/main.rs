@@ -375,10 +375,7 @@ fn print_event(e: &ClientEvent) {
             operation.status
         ),
         ClientPayload::Interaction {
-            method,
-            payload,
-            created_at,
-            ..
+            method, payload, ..
         } => {
             let prompt = payload
                 .get("message")
@@ -388,26 +385,16 @@ fn print_event(e: &ClientEvent) {
                 .unwrap_or_else(|| payload.to_string());
             println!(
                 "\n[{}] [Action required · {method}] {prompt}",
-                gui::format_local_timestamp(*created_at)
+                gui::format_local_timestamp(e.created_at)
             );
         }
         ClientPayload::Error { message, .. } => eprintln!(
             "[{}] error: {message}",
-            gui::format_local_timestamp(
-                chrono::Utc::now()
-                    .timestamp()
-                    .try_into()
-                    .unwrap_or_default()
-            )
+            gui::format_local_timestamp(e.created_at)
         ),
         _ => println!(
             "[{}] {}",
-            gui::format_local_timestamp(
-                chrono::Utc::now()
-                    .timestamp()
-                    .try_into()
-                    .unwrap_or_default()
-            ),
+            gui::format_local_timestamp(e.created_at),
             serde_json::to_string_pretty(e).unwrap()
         ),
     }

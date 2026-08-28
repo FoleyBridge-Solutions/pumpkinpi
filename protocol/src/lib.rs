@@ -541,7 +541,6 @@ pub enum ClientPayload {
         request_id: String,
         method: String,
         payload: Value,
-        created_at: u64,
     },
     ProjectUpdated {
         project: ProjectRecord,
@@ -565,6 +564,8 @@ pub struct ClientEvent {
     #[serde(default = "protocol_version")]
     pub protocol_version: u32,
     pub id: Option<RequestId>,
+    /// Creation time at the event's authoritative origin, as Unix seconds.
+    pub created_at: u64,
     #[serde(flatten)]
     pub payload: ClientPayload,
 }

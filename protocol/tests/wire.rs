@@ -54,10 +54,11 @@ fn reviewer_cannot_approve_with_findings_or_unreviewed_scope() {
 }
 
 #[test]
-fn interaction_events_carry_their_creation_timestamp() {
+fn every_client_event_carries_its_authoritative_creation_timestamp() {
     let event = ClientEvent {
         protocol_version: PROTOCOL_VERSION,
         id: None,
+        created_at: 1_704_164_645,
         payload: ClientPayload::Interaction {
             spoke_id: SpokeId("spoke-1".into()),
             project_id: ProjectId("project-1".into()),
@@ -65,7 +66,6 @@ fn interaction_events_carry_their_creation_timestamp() {
             request_id: "interaction-1".into(),
             method: "confirm".into(),
             payload: serde_json::json!({"message": "Proceed?"}),
-            created_at: 1_704_164_645,
         },
     };
 
@@ -75,10 +75,17 @@ fn interaction_events_carry_their_creation_timestamp() {
 }
 
 #[test]
+fn client_events_without_authoritative_time_are_rejected() {
+    let json = r#"{"protocol_version":3,"id":null,"type":"error","code":"offline","message":"Spoke is offline"}"#;
+    assert!(serde_json::from_str::<ClientEvent>(json).is_err());
+}
+
+#[test]
 fn public_event_does_not_require_raw_json() {
     let event = ClientEvent {
         protocol_version: PROTOCOL_VERSION,
         id: None,
+        created_at: 1_704_164_646,
         payload: ClientPayload::Error {
             code: "offline".into(),
             message: "Spoke is offline".into(),
@@ -87,4 +94,5 @@ fn public_event_does_not_require_raw_json() {
     let value = serde_json::to_value(event).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(value["created_at"], 1_704_164_646_u64);
 }

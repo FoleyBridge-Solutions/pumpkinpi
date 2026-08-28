@@ -195,7 +195,9 @@ kbd { padding: 2px 6px; color: var(--faint); background: #0e1117; border: 1px so
 .operation-row { padding: 9px 0; border-bottom: 1px solid var(--line-soft); }
 .operation-row header { display: flex; justify-content: space-between; gap: 8px; }
 .operation-row b { font-size: 10px; }
-.operation-row span { color: var(--faint); font-size: 9px; }
+.operation-row span, .operation-row time { color: var(--faint); font-size: 9px; }
+.operation-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.operation-meta time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .operation-id, .operation-error { margin: 6px 0; overflow-wrap: anywhere; font-size: 9px; }
 .operation-id { color: var(--faint); }
 .operation-error { color: var(--red); }
@@ -204,6 +206,7 @@ kbd { padding: 2px 6px; color: var(--faint); background: #0e1117; border: 1px so
 .operation-state.completed { color: var(--green); }
 .operation-state.failed, .operation-state.cancelled { color: var(--red); }
 .diagnostic-line { margin-bottom: 7px; padding: 8px; color: #a4abba; background: #0e1117; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 9px; overflow-wrap: anywhere; }
+.diagnostic-line time { display: block; margin-bottom: 4px; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .modal-layer { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgba(3,5,8,.78); }
 .modal, .switcher-modal { color: var(--text); background: #151922; border: 1px solid #303746; border-radius: 14px; box-shadow: var(--shadow); }
