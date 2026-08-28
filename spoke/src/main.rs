@@ -80,11 +80,29 @@ struct Store {
     #[serde(default)]
     reviews: BTreeMap<ReviewId, ReviewRecord>,
     #[serde(default)]
+    review_evidence: BTreeMap<RunId, Vec<ObservedReviewEvidence>>,
+    #[serde(default)]
     workspaces: BTreeMap<OperationId, workspace::WorkspaceRecord>,
     #[serde(default)]
     realizations: BTreeMap<OperationId, orchestrator::RealizationMachine>,
 }
 const INTERNAL_RESUME_MESSAGE: &str = "__pumpkinpi_internal_resume_active_realization_v3__";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObservedReviewEvidence {
+    evidence_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    subject: String,
+    output_lines: Vec<String>,
+    successful: bool,
+    observed_at: u64,
+}
+
+struct PiRunOutput {
+    text: String,
+    observations: Vec<ObservedReviewEvidence>,
+}
 
 type Tx = mpsc::UnboundedSender<SpokeToHub>;
 type Interactions = Arc<Mutex<HashMap<(OperationId, String), oneshot::Sender<serde_json::Value>>>>;
@@ -960,7 +978,7 @@ async fn run_operation(
             &message,
             source.status == SourceStatus::Assembling,
         );
-        let (_, raw) = run_internal(
+        let (_, raw, _) = run_internal(
             &state,
             &tx,
             &project,
@@ -1220,7 +1238,7 @@ async fn run_operation(
             &machine.findings,
             &authoritative_manifest,
         );
-        let (_, raw) = match run_internal(
+        let (_, raw, _) = match run_internal(
             &state,
             &tx,
             &execution_project,
@@ -1316,7 +1334,7 @@ async fn run_operation(
             &implementation,
             &authoritative_manifest,
         );
-        let (review_run_id, raw) = run_internal(
+        let (review_run_id, raw, review_evidence) = run_internal(
             &state,
             &tx,
             &execution_project,
@@ -1354,6 +1372,7 @@ async fn run_operation(
             machine.revision,
             Path::new(&execution_project.cwd),
             &before_review,
+            &review_evidence,
             &review,
         )
         .await?;
@@ -1495,6 +1514,7 @@ fn validate_review_for_promotion(
     revision: u64,
     observed_reality_version: &str,
     authoritative_bundle: Option<&SourceOfIntentBundle>,
+    observed_evidence: &[ObservedReviewEvidence],
 ) -> Result<()> {
     result.validate().map_err(anyhow::Error::msg)?;
     if result.target_revision != revision {
@@ -1508,7 +1528,44 @@ fn validate_review_for_promotion(
             "review observed reality version does not match independently verified Project reality"
         ));
     }
-    source_bundle::validate_coverage(authoritative_bundle, &result.source_coverage)
+    source_bundle::validate_coverage(authoritative_bundle, &result.source_coverage)?;
+    if result.verdict == ReviewVerdict::Approved {
+        corroborate_approval(result, observed_evidence)?;
+    }
+    Ok(())
+}
+
+fn corroborate_approval(
+    result: &ReviewRunResult,
+    observed: &[ObservedReviewEvidence],
+) -> Result<()> {
+    let mut checked = BTreeSet::new();
+    for check in &result.checks {
+        let matches = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.successful && item.subject == *check)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(anyhow!(
+                "approval check is not bound to a successful Spoke-observed tool result: {check}"
+            ));
+        }
+        checked.extend(matches);
+    }
+    for claim in &result.evidence {
+        let supported = checked.iter().any(|index| {
+            let item = &observed[*index];
+            item.evidence_id == *claim || item.output_lines.iter().any(|line| line == claim)
+        });
+        if !supported {
+            return Err(anyhow!(
+                "approval evidence is not present in a Spoke-observed result for a listed check: {claim}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn persist_review(
@@ -1518,6 +1575,7 @@ async fn persist_review(
     revision: u64,
     observed_cwd: &Path,
     expected_fingerprint: &str,
+    observed_evidence: &[ObservedReviewEvidence],
     result: &ReviewRunResult,
 ) -> Result<ReviewRecord> {
     let observed_content_hash = project_fingerprint(observed_cwd.to_path_buf()).await?;
@@ -1538,12 +1596,13 @@ async fn persist_review(
         revision,
         &observed_content_hash,
         source.authoritative_bundle.as_ref(),
+        observed_evidence,
     )?;
     let record = ReviewRecord {
         review_id: ReviewId(new_id("review")),
         spoke_id: state.config.spoke_id.clone(),
         project_id: project_id.clone(),
-        run_id,
+        run_id: run_id.clone(),
         source_of_intent_revision: result.target_revision,
         observed_content_hash: result.observed_reality_version.clone(),
         scope: result.scope.clone(),
@@ -1565,6 +1624,9 @@ async fn persist_review(
         verdict: result.verdict.clone(),
         created_at: now(),
     };
+    store
+        .review_evidence
+        .insert(run_id, observed_evidence.to_vec());
     store
         .reviews
         .insert(record.review_id.clone(), record.clone());
@@ -1666,7 +1728,7 @@ async fn run_internal(
     prompt: &str,
     cancel: watch::Receiver<bool>,
     provider_env: &BTreeMap<String, String>,
-) -> Result<(RunId, String)> {
+) -> Result<(RunId, String, Vec<ObservedReviewEvidence>)> {
     let id = SessionId(new_id("sess"));
     let run_id = RunId(new_id("run"));
     let n = now();
@@ -1715,7 +1777,7 @@ async fn run_internal(
         }
         save_store(&state.data_dir, &s).await?
     }
-    result.map(|text| (run_id, text))
+    result.map(|output| (run_id, output.text, output.observations))
 }
 #[allow(clippy::too_many_arguments)]
 async fn run_pi(
@@ -1727,7 +1789,7 @@ async fn run_pi(
     prompt: &str,
     mut cancel: watch::Receiver<bool>,
     provider_env: &BTreeMap<String, String>,
-) -> Result<String> {
+) -> Result<PiRunOutput> {
     let pi_binary = state.config.pi_binary.clone().unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -1827,6 +1889,8 @@ async fn run_pi(
     stdin.flush().await?;
     let mut lines = BufReader::new(stdout).lines();
     let mut final_text = String::new();
+    let mut observations = Vec::new();
+    let mut pending_tools: HashMap<String, (String, serde_json::Value)> = HashMap::new();
     loop {
         tokio::select! {
             changed = cancel.changed() => {
@@ -1869,6 +1933,24 @@ async fn run_pi(
                         tx.send(event(None, ClientPayload::Interaction { spoke_id: project.spoke_id.clone(), project_id: project.project_id.clone(), operation_id: operation.clone(), request_id, method, payload: v.clone() }))?;
                     }
                 }
+                if event_type == "tool_execution_start"
+                    && let (Some(id), Some(name)) = (
+                        v.get("toolCallId").and_then(|value| value.as_str()),
+                        v.get("toolName").and_then(|value| value.as_str()),
+                    )
+                {
+                    pending_tools.insert(
+                        id.to_string(),
+                        (name.to_string(), v.get("args").cloned().unwrap_or_default()),
+                    );
+                }
+                if event_type == "tool_execution_end"
+                    && let Some(id) = v.get("toolCallId").and_then(|value| value.as_str())
+                    && let Some((tool_name, args)) = pending_tools.remove(id)
+                    && let Some(observation) = observed_review_evidence(&v, tool_name, args)
+                {
+                    observations.push(observation);
+                }
                 if event_type == "message_end" && let Some(t) = message_content(&v) { final_text = t }
                 if event_type == "agent_settled" { break }
             }
@@ -1886,8 +1968,66 @@ async fn run_pi(
             "Pi produced no final assistant message; stderr: {stderr_tail}"
         ));
     }
-    Ok(final_text)
+    Ok(PiRunOutput {
+        text: final_text,
+        observations,
+    })
 }
+
+fn observed_review_evidence(
+    event: &serde_json::Value,
+    tool_name: String,
+    args: serde_json::Value,
+) -> Option<ObservedReviewEvidence> {
+    let tool_call_id = event.get("toolCallId")?.as_str()?.to_string();
+    let subject = match tool_name.as_str() {
+        "bash" => args.get("command")?.as_str()?.to_string(),
+        "read" => args.get("path")?.as_str()?.to_string(),
+        _ => serde_json::to_string(&args).ok()?,
+    };
+    let result = event
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut output_lines = Vec::new();
+    if let Some(content) = result.get("content").and_then(|value| value.as_array()) {
+        for text in content
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+        {
+            output_lines.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    let canonical = json!({
+        "toolCallId": tool_call_id,
+        "toolName": tool_name,
+        "args": args,
+        "result": result,
+        "isError": event.get("isError").and_then(|value| value.as_bool()).unwrap_or(false),
+    });
+    let evidence_id = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(canonical.to_string()))
+    );
+    Some(ObservedReviewEvidence {
+        evidence_id,
+        tool_call_id,
+        tool_name,
+        subject,
+        output_lines,
+        successful: !event
+            .get("isError")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        observed_at: now(),
+    })
+}
+
 fn message_content(v: &serde_json::Value) -> Option<String> {
     let msg = v.get("message")?;
     if let Some(s) = msg.get("content").and_then(|x| x.as_str()) {

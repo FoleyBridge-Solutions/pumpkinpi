@@ -163,8 +163,20 @@ fn interrupted_isolated_realization_is_queued_for_checkpoint_recovery() {
     );
 }
 
+fn observed_check(subject: &str, output: &str) -> ObservedReviewEvidence {
+    ObservedReviewEvidence {
+        evidence_id: "sha256:observed".into(),
+        tool_call_id: "call-observed".into(),
+        tool_name: "bash".into(),
+        subject: subject.into(),
+        output_lines: vec![output.into()],
+        successful: true,
+        observed_at: now(),
+    }
+}
+
 #[test]
-fn promotion_requires_canonical_coverage_revision_and_observed_reality_binding() {
+fn promotion_requires_canonical_coverage_revision_reality_and_observed_evidence() {
     let bundle = SourceOfIntentBundle {
         manifest_path: "design.md".into(),
         bundle_hash: "bundle".into(),
@@ -188,19 +200,57 @@ fn promotion_requires_canonical_coverage_revision_and_observed_reality_binding()
         verdict: ReviewVerdict::Approved,
     };
 
-    assert!(validate_review_for_promotion(&review, 3, "reality-3", Some(&bundle)).is_ok());
+    let observed = vec![observed_check(
+        "cargo test --workspace",
+        "workspace suite passed",
+    )];
+    assert!(
+        validate_review_for_promotion(&review, 3, "reality-3", Some(&bundle), &observed).is_ok()
+    );
 
     let mut stale = review.clone();
     stale.target_revision = 2;
-    assert!(validate_review_for_promotion(&stale, 3, "reality-3", Some(&bundle)).is_err());
+    assert!(
+        validate_review_for_promotion(&stale, 3, "reality-3", Some(&bundle), &observed).is_err()
+    );
 
     let mut wrong_reality = review.clone();
     wrong_reality.observed_reality_version = "model-claimed-reality".into();
-    assert!(validate_review_for_promotion(&wrong_reality, 3, "reality-3", Some(&bundle)).is_err());
+    assert!(
+        validate_review_for_promotion(&wrong_reality, 3, "reality-3", Some(&bundle), &observed,)
+            .is_err()
+    );
 
     let mut incomplete = review;
     incomplete.source_coverage.clear();
-    assert!(validate_review_for_promotion(&incomplete, 3, "reality-3", Some(&bundle)).is_err());
+    assert!(
+        validate_review_for_promotion(&incomplete, 3, "reality-3", Some(&bundle), &observed)
+            .is_err()
+    );
+}
+
+#[test]
+fn fabricated_nonempty_review_prose_cannot_approve() {
+    let review = ReviewRunResult {
+        source_coverage: vec![],
+        target_revision: 1,
+        observed_reality_version: "reality".into(),
+        scope: ReviewScope::WholeProject,
+        reviewed_scope: vec!["complete project".into()],
+        checks: vec!["tests passed".into()],
+        evidence: vec!["evidence exists".into()],
+        findings: vec![],
+        unreviewed_required_scope: vec![],
+        verdict: ReviewVerdict::Approved,
+    };
+
+    let error = validate_review_for_promotion(&review, 1, "reality", None, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not bound to a successful Spoke-observed tool result"));
+
+    let unrelated = vec![observed_check("cargo test --workspace", "all tests passed")];
+    assert!(validate_review_for_promotion(&review, 1, "reality", None, &unrelated).is_err());
 }
 
 #[tokio::test]
@@ -251,7 +301,9 @@ case "$request" in
     ;;
   *"independent whole-Project reviewer"*)
     reality=$(printf '%s' "$request" | sed -n 's/.*observed_reality_version [^0-9a-f]*\([0-9a-f]\{64\}\).*/\1/p')
-    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":["complete project"],"checks":["fixture inspection"],"evidence":["README.md and design.md inspected"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
+    printf '%s\n' '{"type":"tool_execution_start","toolCallId":"call_review","toolName":"bash","args":{"command":"printf fixture-observed"}}'
+    printf '%s\n' '{"type":"tool_execution_end","toolCallId":"call_review","toolName":"bash","result":{"content":[{"type":"text","text":"fixture-observed\n"}]},"isError":false}'
+    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":["complete project"],"checks":["printf fixture-observed"],"evidence":["fixture-observed"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
     ;;
   *)
     result='{"source_coverage":__COVERAGE__,"objective":"verify fixture","summary":"Fixture conforms.","observations":["README exists"],"changes":[],"validation":["fixture inspected"],"evidence":["README.md"],"residual_divergence":[],"question":null}'

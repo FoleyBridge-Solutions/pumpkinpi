@@ -178,7 +178,9 @@ Read and hash every document in the authoritative bundle before review. Return e
 Return ONLY one JSON object with this schema:
 {{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
 
-Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, and unchanged Project reality. Use verdict "approved" only when scope is whole_project, reviewed_scope, checks, and evidence are nonempty, findings and unreviewed_required_scope are empty, and the evidence supports finding no fault in Project reality against this entire intent revision.
+For an approval, every checks entry must be the exact command string of a successful bash tool call or exact path of a successful read tool call performed during this review. Every evidence entry must be either an exact nonempty output line from one of those listed checks or its durable sha256 evidence ID. The Spoke captures tool start/end events, independently corroborates these bindings, and durably stores the observations; unsupported prose is rejected. Findings may continue to cite descriptive evidence.
+
+Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, unchanged Project reality, and observed check evidence. Use verdict "approved" only when scope is whole_project, reviewed_scope, checks, and evidence are nonempty, findings and unreviewed_required_scope are empty, and the corroborated evidence supports finding no fault in Project reality against this entire intent revision.
 
 SOURCE OF INTENT revision {revision}:
 {source}
