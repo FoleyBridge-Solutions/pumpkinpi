@@ -518,6 +518,24 @@ fn spoke_issues_file_and_validation_obligations_from_reality() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn review_and_observation_purposes_use_read_only_project_mounts() {
+    for purpose in [
+        SessionPurpose::Intent,
+        SessionPurpose::Inspection,
+        SessionPurpose::Review,
+    ] {
+        assert_eq!(project_mount_option(&purpose), "--ro-bind");
+    }
+    for purpose in [
+        SessionPurpose::Implementation,
+        SessionPurpose::Validation,
+        SessionPurpose::Recovery,
+    ] {
+        assert_eq!(project_mount_option(&purpose), "--bind");
+    }
+}
+
 #[tokio::test]
 async fn review_run_cannot_mutate_checkpoint_or_host_tmp() {
     let dir =
