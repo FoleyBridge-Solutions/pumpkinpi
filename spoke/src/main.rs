@@ -1660,11 +1660,13 @@ async fn run_pi(
     mut cancel: watch::Receiver<bool>,
     provider_env: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let pi_binary = state
-        .config
-        .pi_binary
-        .as_deref()
-        .unwrap_or_else(|| Path::new("pi"));
+    let pi_binary = state.config.pi_binary.clone().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local/share/mise/installs/pi/latest/pi/pi"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("pi"))
+    });
     let isolated = state.store.lock().await.workspaces.get(operation).cloned();
     let mut cmd = Command::new("bwrap");
     cmd.args([
@@ -1699,7 +1701,7 @@ async fn run_pi(
     cmd.arg("--chdir")
         .arg(&sandbox_cwd)
         .arg("--")
-        .arg(pi_binary)
+        .arg(&pi_binary)
         .arg("--mode")
         .arg("rpc")
         .arg("--no-session")
