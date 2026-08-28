@@ -1,84 +1,83 @@
-# Internal Sessions and Runs
+# Native Sessions and Runs
 
-Sessions and Runs are PumpkinPi execution machinery. They are documented because they are required for implementation, reliability, safety, and diagnostics; they are not the primary product object.
+Sessions and Runs are Slice execution machinery. Users normally interact with Slice's coding conversation or a Project Intent Chat, not runtime process management.
 
-The user normally interacts only with a Project's Intent Chat. PumpkinPi creates, resumes, coordinates, and retires internal Sessions to maintain the Source of Intent and make Project reality conform to it.
+## Roles
 
-## Multiple Projects and Internal Sessions
+Every Session declares one purpose:
 
-A Spoke can host many Projects, and each Project can have concurrent internal work:
+- `interactive`: standalone bounded coding conversation;
+- `intent`: interpret owner conversation and propose Source changes;
+- `inspection`: read-only situated observations;
+- `implementation`: mutate an assigned checkout/worktree toward an objective;
+- `validation`: supervised deterministic checks and assessment;
+- `review`: independent whole-Project review with reusable valid context/evidence;
+- `approval_review`: cold independent final approval candidate;
+- `recovery`: diagnose or repair failed machinery.
+
+Every Run binds its actual Source revision, Project reality, operation, objective where applicable, provider/model/account reference, tool policy, and effective identity.
+
+## Concurrency
+
+Commands serialize within a Session. Independent Sessions may stream concurrently subject to per-Project, per-Slice, provider, tool-resource, and policy limits. One Project intent-maintenance lane serializes canonical Source commits; realization promotion is serialized transactionally.
+
+A Slice core owns active runtime leases. TUI, local CLI, and Hub-routed `slice gui` requests submit typed commands to that core rather than opening competing model loops. GUI or terminal disconnect does not stop accepted work by default.
+
+## Persistence
+
+A native Session is an append-only SQLite event stream plus derived context checkpoints. It has no external-agent process or session file. Persist accepted commands, model-visible messages, tool calls/results, interaction boundaries, usage, cancellation, structured outcomes, and compaction metadata. Provider socket state is ephemeral and reconstructed.
+
+Hidden chain-of-thought is neither required nor stored. Derived summaries are bound to exact event ranges and are never authority or evidence.
+
+## Interactive Sessions
+
+Standalone `slice` interactive mode may operate in the selected checkout after explicit trust and mutation-policy display. It provides visible tools/diffs/validation and can resume context. A completed interactive request does not imply Source-of-Intent or whole-Project satisfaction.
+
+## Realization Sessions
+
+Implementation and validation use a per-operation isolated Git worktree. Each successful implementation increment creates a checkpoint. Independent review examines the complete checkpoint against complete current intent. Findings drive another objective; cold approval promotes through a crash-idempotent fast-forward transaction.
+
+Implementer and reviewer context never mix. Warm reviewer state can retain validated complete-review knowledge. Approval review starts with a newly isolated context and fresh evidence required by policy.
+
+## Execution Identity
+
+Slice may run with administrative privilege to manage Projects owned by different local users, but each tool execution has explicit uid/gid/root state. Root is denied unless Project setting, operation need, and local policy all permit it. Identity, writable mounts, network policy, command environment fingerprint, and provider isolation are recorded.
+
+Provider requests execute in Slice. Project tools do not inherit provider or Hub credentials.
+
+## Queueing and Cancellation
+
+Queues prioritize interaction responses and cancellation over ordinary prompts and background work. Cancellation propagates through operation, objective, native provider stream, pending model turn, queued/active tools, interaction, and eventual timeline state.
+
+Graceful command termination has a bounded deadline followed by process-group kill. Provider cancellation closes the stream and records whether billing/remote completion may be unknown. Late results remain stale diagnostics and cannot mutate authority.
+
+## Context Staleness
+
+A context checkpoint is valid only for its bound Source revision, role, Project hashes/observations, and policy. Intent or material reality changes invalidate incompatible observations and approval. Safe reusable content-addressed evidence remains explicit; stale memory is never silently trusted.
+
+## Failure and Recovery
+
+Typed failures distinguish provider rejection/rate limit/transport, invalid model output, tool policy denial, command failure, sandbox failure, runtime bug, persistence failure, interaction timeout, stale revision, and cancellation.
+
+A crash record retains last durable event, role, revision, objective, provider/model, active tool, redacted diagnostic details, exit/signal where a child process died, and recovery policy.
+
+On restart Slice:
+
+1. reconciles Sessions/Runs with durable events;
+2. validates worktree, checkpoint, Source, policy, and context bindings;
+3. rolls uncommitted implementation state back only according to the recorded phase;
+4. resumes from the exact safe phase rather than always repeating implementation;
+5. marks uncertain/missing/corrupt state blocked with retained diagnostics;
+6. publishes concise Project-level impact and recovery actions.
+
+## Lifecycle
 
 ```text
-Spoke
-  ├─ Project: /home/me/app
-  │   ├─ Intent Chat / intent-maintenance Session
-  │   ├─ implementation Run
-  │   └─ validation Run
-  └─ Project: /home/me/website
-      ├─ Intent Chat / intent-maintenance Session
-      └─ inspection Run
+starting -> idle -> running -> idle
+                    -> blocked -> running
+                    -> stopped
+                    -> crashed -> recovering | stopped
+                    -> stale
 ```
 
-Each active Session has its own Pi RPC process. Commands are serialized per Session, not globally, while independent Sessions may run in parallel.
-
-Client disconnect must not kill work by default. Multiple Clients may observe the same Project/Intent Chat, but they should not need to attach manually to each internal Session.
-
-## Session Purpose and Intent Binding
-
-Every internal Session/Run must have a declared purpose:
-
-- `intent`: interpret conversation, update Source of Intent, and project it back to users
-- `inspection`: gather context/evidence without primarily changing Project state
-- `implementation`: change Project reality toward a Source of Intent revision
-- `validation`: test claims and behavior produced by implementation
-- `review`: independently inspect complete Project reality against a complete Source of Intent revision, returning every finding or approval with no findings
-- `recovery`: diagnose or repair failed internal work
-
-Implementation and validation Runs execute in a per-operation isolated Git worktree, never directly in the primary Project checkout. Each successful implementation iteration creates a durable checkpoint commit. Independent review examines that checkpoint; zero-finding approval promotes it to the primary checkout with an automatic fast-forward transaction. Primary-checkout drift or a non-fast-forward blocks promotion rather than overwriting work. No per-iteration permission gate is required.
-
-Implementation, validation, and review Runs record the Source of Intent revision they serve. If intent changes materially while a Run is active, PumpkinPi must decide whether to continue, cancel, or mark its output as based on stale intent. It must not silently present stale work as satisfying current intent.
-
-After each implementation/validation increment, an independent review Run evaluates the whole Project against the whole current Source of Intent. Every finding feeds another bounded implementation iteration. Project realization is satisfied only when review returns no findings and no required scope remains unreviewed. Iteration or resource limits pause work; they never imply success.
-
-## Reporting Back to Intent Chat
-
-Raw Session output remains internal detail by default. PumpkinPi should promote information to Intent Chat when it is:
-
-- a clarification or decision needed from the user
-- a meaningful progress/status transition
-- a consequential safety prompt
-- an outcome and its evidence
-- a divergence between intent and reality
-- a failure requiring user-visible recovery
-
-## Pi Process Execution Identity
-
-The Spoke daemon may run as root, but each Pi subprocess has explicit `run_as_user` / `run_as_root` settings.
-
-Default behavior:
-
-- Project Sessions run as the Project owner or configured `run_as_user`
-- root Sessions are denied unless `allow_root_sessions` is true, the operation explicitly requires root, and local Spoke policy allows it
-- effective user is recorded in Session metadata, evidence, and audit logs
-- provider credentials delivered to Pi are accessible to that effective user and privileged Spoke daemon
-
-## Process Death and Recovery
-
-If a Pi subprocess exits unexpectedly, the Spoke must:
-
-1. mark the internal Session `crashed`
-2. record exit status/signal, stderr tail, timestamp, purpose, affected Source of Intent revision, and last known Pi metadata
-3. broadcast normalized crash state to orchestration/subscribers
-4. update Intent Chat with a concise explanation when the crash affects visible work
-5. reject ordinary commands while crashed except lifecycle/diagnostic commands
-
-Restart behavior is explicit and durable:
-
-- uncommitted isolated changes are discarded to the last checkpoint
-- persisted realization phase, iteration, findings, operation, and workspace binding are recovered
-- active realization is queued and resumes automatically after Spoke authentication
-- restart creates a new Pi process while preserving PumpkinPi operation identity
-- already checkpointed changes are inspected from current isolated reality rather than blindly repeated in primary
-- missing or corrupt worktrees block with retained diagnostics instead of recreating uncertain destructive state
-
-Late observers should receive Project/Intent Chat state and promoted outcomes first. Detailed diagnostics may additionally replay durable internal Session entries.
+A Run is bounded and terminal; a Session may host many Runs. A Project realization persists across Sessions/Runs and reaches satisfaction only through the independent approval contract.

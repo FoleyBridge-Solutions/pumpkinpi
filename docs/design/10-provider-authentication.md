@@ -1,92 +1,60 @@
-# Provider Authentication
+# Provider Authentication and Models
 
-Provider login happens once through the Client. The owner should not have to log in separately on every Spoke.
+Slice's native Rust provider layer calls provider HTTPS APIs directly. PumpkinPie does not rely on an external agent, provider CLI, Node SDK, or language sidecar.
 
-The Client owns the login UX: OAuth browser flows, subscription login prompts, API-key entry, account selection, and provider connection management. The personal Hub persists the resulting provider account information so it can be reused across Spokes and Projects.
+## Account Custody
 
-Pi supports provider credentials through:
+Provider accounts may be:
 
-- OAuth/subscription login via Pi interactive `/login`
-- API keys stored in Pi `auth.json`
-- provider environment variables
-- custom provider config in `models.json`
+- Hub-managed for use across enrolled Slices;
+- Slice-local for standalone use;
+- external platform-secret references.
 
-Pi stores credentials by default in:
+Metadata uses product-level provider/account/model IDs. Secret material is encrypted at rest with envelope-key rotation or referenced from a platform credential service. Account label/ID selection is explicit; “first matching provider” is not sufficient.
+
+## Standalone Login
+
+```bash
+slice auth login PROVIDER
+slice auth set-key PROVIDER
+slice auth list
+```
+
+Secrets are entered through terminal-safe hidden prompt, browser OAuth/device flow, protected stdin descriptor, or external credential reference. API keys are never positional argv values, ordinary shell history, timeline content, or diagnostic evidence.
+
+OAuth callback/device flow is implemented in Rust. Refresh tokens remain in provider custody storage; access tokens are refreshed by the native provider client.
+
+## Hub Delivery
+
+For an enrolled Run requiring a Hub account:
 
 ```text
-~/.pi/agent/auth.json
-~/.pi/agent/models-store.json
-~/.pi/agent/models.json
+Slice GUI selects account reference
+  -> Hub authorizes Project/Slice/model/purpose
+  -> Hub delivers encrypted/scoped short-lived provider capability
+  -> Slice native provider client uses it
 ```
 
-Pi credential resolution order is:
+Provider material is delivered only for actual model execution, not list/get/subscribe/remove/cancel commands. It is excluded from Project tool environments, provider-visible prompts, events, artifacts, command output, and audit details.
 
-1. CLI/process API key override
-2. `auth.json`
-3. environment variables
-4. custom provider keys from `models.json`
+Slice-local and Hub accounts do not overwrite one another silently. Project/Session records state selected account reference and fallback policy.
 
-PumpkinPi should make that Pi credential model invisible to end users where possible: the user logs in once in the Client, selects the provider/model in the Client, and PumpkinPi arranges for the Spoke-launched Pi process to use the selected provider account.
+## Provider Support
 
-### Client-Initiated Provider Login Model
+The native runtime initially supports Anthropic, OpenAI, Google Gemini, and OpenAI-compatible/OpenRouter APIs. A capability registry records models, context/output limits, streaming, tools, structured output, reasoning controls, modalities, pricing/usage metadata, and authentication methods.
 
-```text
-Client
-  → owner logs in to provider once
-Personal Hub
-  → stores provider account/credential material and preferences
-Project
-  → stores default provider/model selection metadata
-Spoke
-  → receives the provider account material needed to launch/run Pi
-Pi
-  → uses that provider account for the session
-```
+Model selection is validated against account/provider capability before Run start. Raw provider model catalogs are normalized and cached with freshness/source.
 
-The Hub should store provider accounts securely and remember provider/model usage, Project preferences, recent choices, and UI selection defaults.
+## Secret Boundary
 
-Operational rule: an authenticated Client of the personal Hub has administrative control over every enrolled Spoke's PumpkinPi capabilities. Spoke-launched Pi usually runs as the configured Project or Session user, with root Sessions allowed only by policy, but provider material delivered to a Spoke must still be considered accessible to that Spoke, its privileged daemon, and the Pi subprocess effective user.
+The privileged Slice process and native provider module can access necessary account capability. Project child tools cannot. Provider requests occur outside Project sandboxes. Redaction applies before persistence/logging and handles headers, URLs/query fields, JSON payloads, environment values, tool output, panic/error chains, and exported diagnostics.
 
-### Provider and Model Selection
+## Rotation, Revocation, and Failure
 
-Projects may define default provider/model settings. Users can change these through Project settings or ask through Intent Chat; they do not choose providers separately for each internal Session during normal use.
+Rotation is atomic and retains recoverable envelope metadata. Revoked/expired accounts stop new Runs and produce explicit blocked state; already in-flight behavior follows provider and owner policy. Refresh failure, insufficient scope, model denial, quota/rate limit, transport/TLS, and malformed provider streams are distinct typed errors.
 
-```json
-{
-  "type": "project.model.set",
-  "spoke_id": "spoke_home",
-  "project_id": "proj_api",
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-5:high"
-}
-```
+No provider authentication failure may fall back silently to a different account/model with materially different privacy, cost, or behavior.
 
-PumpkinPi provider/model selectors are product-level identifiers. The Hub stores and presents choices globally and per Project. Orchestration applies them to internal Sessions, and the Spoke translates them to Pi startup/RPC parameters such as `--provider`, `--model`, `set_model`, and `set_thinking_level`.
+## Local Development
 
-### Hub-Owned Provider Account Store
-
-Hub stores provider credentials encrypted at rest. The credential store uses envelope encryption, KMS/HSM or operator-managed master keys, rotation, backup/restore handling, and auditability without logging secret values.
-
-```text
-provider_accounts
-  provider_account_id
-  provider_id
-  display_name / account_label
-  auth_type: api_key | oauth | subscription | external_secret_ref
-  encrypted_secret
-  available_models optional
-  default_model optional
-  created_at
-  updated_at
-  revoked_at
-```
-
-### Credential Safety Rules
-
-- Provider login should happen once in the Client, not manually on every Spoke.
-- Do not enroll a Spoke unless every authenticated Client of the personal Hub may administer it through PumpkinPi.
-- Hub may store provider credentials, provider names, account labels, model preferences, availability metadata, and project defaults.
-- Hub must encrypt provider secret values such as API keys, OAuth tokens, refresh tokens, and subscription credentials at rest.
-- Provider secrets should never be sent back to clients after initial entry/login.
-- Spoke diagnostics and audit logs must avoid recording provider secrets from Pi config files, environment variables, credential payloads, or command output.
-
+Environment-variable credentials may be accepted only under explicit development policy and are still excluded from tool subprocesses and diagnostics. Production packaging requires no provider-specific executable or non-Rust runtime.

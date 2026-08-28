@@ -2,137 +2,116 @@
 
 ## Product Thesis
 
-> **PumpkinPi brings the projects and LLM capabilities of all your computers into one personal Hub, while keeping execution grounded on the Spokes where the real context lives.**
+> **PumpkinPie brings the projects and LLM capabilities of all your computers into one personal Hub, while keeping execution grounded on Slices where the real context lives.**
 
-The governing principle is:
+**Unified at the Hub, situated on the Slice, directed by intent.**
 
-> **Unified at the Hub, situated on the Spoke, directed by intent.**
+PumpkinPie gives one person a coherent place to maintain Project intent and have native agents realize it inside the real local contexts where Projects live. **Slice** is the situated agent: a standalone Rust TUI/CLI and an enrollable execution endpoint. The Hub is valuable but optional for local Slice use.
 
-PumpkinPi gives one person a coherent place to maintain project intent and have agents realize that intent inside the real local contexts where the projects live.
+PumpkinPie is not primarily a remote shell, worker dashboard, chat wrapper, or CI host. Its primary product object is a Project's **Intent Chat**, backed by a durable **Source of Intent** and repeated evidence-backed reconciliation of Project reality.
 
-The Hub must not blur away location. Work is unified through one experience, but it remains situated in a specific Project on a specific Spoke, running as a specific local identity with real capabilities and consequences.
+## Components
 
-## Product Model
+### PumpkinPie Hub
 
-User-facing model:
+The personal Hub provides one authenticated control plane across Slices:
 
-```text
-Personal Hub
-  └─ Projects
-      └─ Intent Chat
-          └─ Source of Intent
-```
+- Slice enrollment, authentication, disable/revoke, and inventory cache;
+- provider-account custody and capability delivery;
+- multiplexed Project/Intent subscriptions;
+- routing, replay, stale/offline projections, and redacted audit;
+- no direct Project filesystem authority.
 
-Situated/internal model:
+### Slice
 
-```text
-Personal Hub
-  ├─ Clients
-  └─ Spokes
-      └─ Projects
-          ├─ Source of Intent
-          ├─ Intent Chat
-          └─ Internal Sessions / Runs
-              └─ implementation, validation, independent review, evidence, recovery
-```
+Slice is one native Rust executable with selectable roles:
 
-- **Hub**: one person's point of presence across their connected computers. It provides authentication, enrollment, presence, routing, continuity, and cross-Spoke visibility.
-- **Spoke**: one connected computer. It contributes local projects, files, tools, compute, credentials, and execution context to the Hub.
-- **Project**: a trusted working environment on one Spoke, rooted at a local directory, defined by a Source of Intent.
-- **Source of Intent**: the canonical LLM-facing project definition: purpose, goals, constraints, decisions, validation strategy, current status, and open questions. It need not be directly human-readable; Intent Chat renders appropriate explanations and summaries.
-- **Intent Chat**: the primary conversational interface for a Project. Its job is to evolve the Source of Intent and report outcomes, evidence, and divergences.
-- **Session / Run**: internal persistent LLM execution situated in one Project. Sessions implement work, validation, and recovery, but they are not the primary user-facing abstraction.
-- **Client**: a GUI, CLI, or API consumer connected to the Hub. A Client is a view into ongoing project intent and work, not the owner of execution lifetime.
+- `slice [PATH]`: standalone TUI coding agent with no Hub requirement;
+- `slice serve`: local situated execution authority, service/local IPC, and enrolled Hub endpoint;
+- `slice gui`: graphical PumpkinPie Hub client;
+- headless CLI turns and local realization commands.
 
-The product should remain close to the LLM where it matters: the user converses naturally with project intent. PumpkinPi should not make the user manage artificial workers, tickets, queues, or raw protocol concepts.
+Serve/TUI share the native provider/runtime/tool implementation without becoming competing authorities. GUI shares protocol/domain packaging but remains a non-authoritative Hub view/controller. A person can use any combination on one or several machines. A serve endpoint can host many Projects and retains local authority offline or unenrolled.
 
-## Topology
+### Project
+
+A Project binds a stable identity to a canonical local path, Slice, Source of Intent, Intent Chat, execution identity, trust/policy, provider/model defaults, repository/worktree metadata, and durable history.
+
+## Core Loop
 
 ```text
-Clients
-   ⇅
-Personal PumpkinPi Hub
-   ⇅ outbound persistent connections
-PumpkinPi Spokes
-   ⇅
-Projects / Sources of Intent / Internal Sessions
+Owner clarifies intent in Intent Chat
+  -> Slice validates and commits Source of Intent
+  -> inspect current situated reality
+  -> select a coherent bounded objective
+  -> implement in an isolated worktree
+  -> execute deterministic validation and capture evidence
+  -> independent whole-Project review against complete intent
+       findings -> durable divergence -> next iteration
+       no findings and complete scope -> cold approval -> promote
+       question/policy/failure/stale -> pause visibly
 ```
 
-Spokes connect outbound to the Hub, avoiding inbound NAT and firewall configuration. Clients connect to the Hub rather than directly to each Spoke.
+Active intent is standing authorization within Project trust and local policy. The loop continues for however many iterations are needed. Resource limits may pause but never imply success.
 
-## Personal Hub Scope
+Interactive `slice` coding turns use the same runtime and tools under a visible direct-checkout policy, but bounded interactive completion is not whole-Project satisfaction.
 
-The initial Hub belongs to one person. Authentication determines whether a Client or Spoke belongs to that personal Hub; the system does not yet model users sharing selected Spokes or Projects.
+## Rust-Only Native Runtime
 
-Multiuser support will be designed together with multitenancy. The initial design must not claim that partial access-grant machinery constitutes a safe multiuser model.
+PumpkinPie application and test logic is Rust. Slice owns provider HTTP streaming, tool calls, context, interactions, persistence, and recovery. It does not launch or embed an external coding agent, Node.js runtime, JavaScript/TypeScript/Python sidecar, or provider CLI.
 
-## Intent-Driven Work
+External Project/system tools such as Git, Bubblewrap, Cargo, compilers, tests, and `rg` may run under Slice supervision. Provider credentials remain in Slice's native provider client and are excluded from Project tool processes.
 
-PumpkinPi's central loop is:
+See [Native Rust Agent Runtime](17-native-runtime.md).
+
+## Local and Connected Use
 
 ```text
-User clarifies intent in Intent Chat
-  ↓
-PumpkinPi updates the Project's Source of Intent
-  ↓
-PumpkinPi launches/coordinates situated implementation and validation work
-  ↓
-An independent reviewer assesses complete Project reality against complete intent
-  ├─ findings return to another implementation iteration
-  └─ no findings establishes satisfaction for that revision
-  ↓
-PumpkinPi reports evidence, outcomes, and divergences back through Intent Chat
+slice .
+  -> local Project and Session authority
+  -> optionally: slice enroll --hub ...
+  -> the same Projects appear through `slice gui`
+  -> local TUI, GUI, and other authorized GUI instances observe one event history
 ```
 
-The user maintains intent. PumpkinPi realizes intent. Agents perform situated work. PumpkinPi continues implementation and independent whole-Project review for however many iterations are required until the reviewer finds no fault, or work is explicitly paused, cancelled, or blocked.
+Enrollment does not migrate authority to the Hub, duplicate Sessions, or weaken local path trust. Closing `slice gui` does not stop accepted work. Hub disconnect leaves local use available and cached remote views explicitly stale.
 
-Project initialization is therefore the process of assembling the initial Source of Intent, not simply choosing a directory and opening a blank chat.
+## Trust Boundary
 
-## Current Session Implementation
+This is initially a personal single-owner system. Administrative access to the Hub controls enrolled PumpkinPie capabilities, but every consequential operation remains situated and legible:
 
-The current implementation uses Pi to execute internal Sessions / Runs. Each active Session owns one Pi subprocess launched by its Spoke:
+- Slice/machine;
+- canonical Project path and worktree;
+- effective user/root state;
+- provider/model/account reference;
+- writable surfaces, network/tool capability, and risk;
+- Source revision and operation.
 
-```bash
-pi --mode rpc
-```
+Slice enforces trusted roots, symlink containment, execution identity, sandbox policy, provider isolation, and root restrictions locally. Hub trust cannot override local policy silently.
 
-Pi is an implementation choice, not a user-facing layer in the product model. Users interact with Projects, Intent Chat, Sources of Intent, providers, models, outcomes, and evidence; they do not select or manage the underlying engine. PumpkinPi is expected to support one Session implementation at a time.
+## Product Constraints
 
-The design should avoid needless Pi-specific concepts in normal product surfaces, while also avoiding speculative plugin or adapter architecture. If the implementation moves away from Pi, it will be migrated deliberately; that future possibility does not justify abstractions users do not need today.
+- Hub routing never becomes Project filesystem authority.
+- Slice remains independently useful without Hub connectivity.
+- Source of Intent is distinct from conversation, projections, Run output, and evidence.
+- Model output is an untrusted proposal.
+- Tool results become evidence only through Slice capture.
+- Implementers cannot approve their own work.
+- Review is whole-Project after every implementation increment.
+- Final approval uses a cold independent Session.
+- Normal product surfaces hide internal orchestration unless needed for trust, progress, or diagnostics.
+- Stable IDs and durable cursors govern identity; names remain user-friendly projections.
+- No permanent legacy runtime, protocol, executable, state path, or compatibility API remains after the prerelease migration.
 
-Pi RPC speaks strict JSONL over stdin/stdout. The Spoke writes Pi RPC commands to stdin and reads events and responses from stdout.
+## Quality Bar
 
-PumpkinPi Session identity is distinct from Pi's internal identity. The Spoke tracks both:
+PumpkinPie should feel like delegated work that remains understandable:
 
-```text
-PumpkinPi session_id -> Pi process -> Pi sessionId/sessionFile/leafId/sessionName
-```
-
-Commands that can change Pi's internal Session binding (`new_session`, `switch_session`, `fork`, `clone`) must be denied unless handled by explicit PumpkinPi operations that update the Spoke Session registry atomically.
-
-## Trust and Execution
-
-Installing a Spoke means trusting the personal Hub to administer PumpkinPi capabilities on that computer.
-
-A Spoke daemon may run as root so it can manage Projects owned by different local users. Each internal Session still has an explicit execution identity. By default, the Spoke launches Pi as the configured Project or Session user. Root Sessions require explicit local policy and explicit selection.
-
-The user should always be able to understand where work runs, which Project it inhabits, which Source of Intent it is serving, and which local identity it uses.
-
-## Design Constraints
-
-- Rust implementation.
-- No JavaScript, Python, or other scripting-language core components.
-- One personal Hub with many Spokes.
-- Spokes connect outbound to the Hub.
-- Hub-issued setup keys are required for Spoke enrollment.
-- Many Projects per Spoke.
-- Each Project has one primary Intent Chat and one canonical Source of Intent.
-- Many internal Sessions / Runs may exist per Project, but they are subordinate to Intent Chat and Source of Intent.
-- Many Clients may observe and control a Project's Intent Chat and visible work state.
-- A Client may work across all connected Spokes simultaneously.
-- Client disconnect does not kill internal Sessions by default.
-- Commands are serialized per internal Session, while Sessions run in parallel.
-- The primary Client is a GUI.
-- Normal product surfaces use PumpkinPi concepts, not raw transport or Pi JSON.
-- Provider and model choices are visible; the underlying Session implementation is not a user choice.
-- Reconnect, replay, diagnostics, crash recovery, and explicit execution context are core requirements.
+- immediate durable acknowledgement;
+- visible intent/revision and situated context;
+- useful progress without raw event noise;
+- precise scope and evidence language;
+- reconnect/replay without duplication;
+- explicit offline, stale, blocked, conflict, crash, and recovery states;
+- native local responsiveness in Slice TUI;
+- no requirement to install a language runtime or external coding-agent framework.

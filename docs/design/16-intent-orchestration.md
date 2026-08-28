@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document defines the behavioral core of PumpkinPi: how a Project-level conversation becomes durable intent, how that intent governs situated work, and how PumpkinPi determines what has or has not been accomplished.
+This document defines the behavioral core of PumpkinPie realization: how a Project-level Intent Chat becomes durable intent, how that intent governs situated work, and how PumpkinPie determines what has or has not been accomplished. Standalone bounded `slice` coding conversations may operate without active Project-wide intent, but cannot claim standing authorization or whole-Project satisfaction; `slice realize` and serve/Hub-directed intent follow this document completely.
 
-PumpkinPi's goal is:
+PumpkinPie's goal is:
 
 > **Implement the active Source of Intent, through however many implementation-and-review iterations are required, until a reviewer can find no fault in Project reality against that Source of Intent.**
 
@@ -12,11 +12,11 @@ The central invariant is:
 
 > **A Source of Intent describes the desired state of a Project. A user message is evidence about or an instruction concerning that intent. A Run is only one bounded attempt to move reality toward it. A review is an independent assessment of the whole result. None of these are interchangeable.**
 
-PumpkinPi must not collapse broad project intent into a disposable prompt, treat a projection as canonical state, or treat one completed Run as proof that the Project satisfies its Source of Intent. It continues the realization loop until independent review returns no findings, the owner pauses or cancels it, a decision is required, or policy makes further work impossible. Resource or iteration limits may pause work; they must never be converted into success.
+PumpkinPie must not collapse broad project intent into a disposable prompt, treat a projection as canonical state, or treat one completed Run as proof that the Project satisfies its Source of Intent. It continues the realization loop until independent review returns no findings, the owner pauses or cancels it, a decision is required, or policy makes further work impossible. Resource or iteration limits may pause work; they must never be converted into success.
 
 ## Governing Model
 
-PumpkinPi operates across four distinct layers:
+PumpkinPie operates across four distinct layers:
 
 ```text
 Owner conversation
@@ -32,7 +32,7 @@ Each layer has different authority:
 
 - The **owner conversation** supplies goals, corrections, decisions, questions, and authorization.
 - The **Source of Intent** is the durable definition of what should be true. Authoritative Project documents are retained as an exact content-addressed closed bundle; generated synthesis supplements but never replaces their bytes.
-- **Observed reality and evidence** describe what PumpkinPi has grounds to believe is true.
+- **Observed reality and evidence** describe what PumpkinPie has grounds to believe is true.
 - **Runs** inspect or change reality for a declared purpose and intent revision.
 
 Assistant prose is a human-facing projection. It is never, by itself, a Source of Intent commit, an observation, evidence, authorization, or proof of satisfaction.
@@ -43,7 +43,7 @@ Project intent may be broad, specific, long-lived, and only partially satisfied.
 
 A task has a terminal lifecycle. Project intent does not become complete merely because a task or Run terminates.
 
-PumpkinPi must therefore maintain separate state for:
+PumpkinPie must therefore maintain separate state for:
 
 - Source of Intent revision and status;
 - current observations about Project reality;
@@ -63,11 +63,11 @@ An Intent Chat message is interpreted in Project context. It may contain one or 
 - **correct** — replace an incorrect assumption or requirement;
 - **decide** — resolve an open question or consequential choice;
 - **reference context** — identify Project material that should inform intent, such as design documents;
-- **request projection** — ask what PumpkinPi currently believes;
-- **request inspection** — ask PumpkinPi to observe reality without changing it;
+- **request projection** — ask what PumpkinPie currently believes;
+- **request inspection** — ask PumpkinPie to observe reality without changing it;
 - **request realization** — prioritize or redirect work intended to change reality;
 - **request validation** — ask whether reality satisfies some or all current intent;
-- **answer** — respond to a pending PumpkinPi question;
+- **answer** — respond to a pending PumpkinPie question;
 - **redirect or cancel** — alter or stop visible work.
 
 These acts are not mutually exclusive. Interpretation must preserve all material acts rather than reducing the message to one `execute` boolean.
@@ -88,7 +88,7 @@ During initialization, referenced local material must be inspected by an inspect
 
 ## Intent Maintenance Pipeline
 
-Every Intent Chat turn follows a Spoke-controlled pipeline.
+Every Intent Chat turn follows a Slice-controlled pipeline.
 
 ### 1. Durably acknowledge
 
@@ -106,7 +106,7 @@ The Intent Agent emits a typed proposal containing:
 - proposed inspection, realization, or validation objectives;
 - the basis for activation, pause, prioritization, or any exceptional authorization claim.
 
-The model proposes. The Spoke validates and commits.
+The model proposes. The Slice validates and commits.
 
 ### 3. Obtain missing context
 
@@ -116,7 +116,7 @@ Inspection output must not be presented as implementation, and it must not direc
 
 ### 4. Commit intent atomically
 
-When a valid Source of Intent proposal exists, the Spoke first verifies complete path/hash coverage of every authoritative document and rejects lossy, missing, changed, duplicate, or out-of-manifest material. It then:
+When a valid Source of Intent proposal exists, the Slice first verifies complete path/hash coverage of every authoritative document and rejects lossy, missing, changed, duplicate, or out-of-manifest material. It then:
 
 1. checks the expected base revision and hash;
 2. validates representation limits and required invariants;
@@ -141,15 +141,15 @@ Intent assembly and intent realization remain separate state transitions, but th
 
 Rules:
 
-- PumpkinPi does not mutate Project reality while intent is `absent`, `assembling`, `updating`, `conflicted`, or `unavailable`.
+- PumpkinPie does not mutate Project reality while intent is `absent`, `assembling`, `updating`, `conflicted`, or `unavailable`.
 - Project initialization authorizes bounded read-only inspection needed to assemble initial intent.
-- Once sufficient intent is confirmed or otherwise made `active`, PumpkinPi begins or resumes realization automatically.
+- Once sufficient intent is confirmed or otherwise made `active`, PumpkinPie begins or resumes realization automatically.
 - Clarifications, corrections, and decisions update the governing revision; they do not create isolated implementation tasks.
 - User requests may prioritize, redirect, pause, resume, or narrow realization, but are not required to authorize every bounded increment.
 - Consequential ambiguity, an unresolved owner decision, or a policy boundary blocks affected mutation and produces a question.
 - The owner can pause or cancel realization explicitly. A pause is not satisfaction.
 
-For example, when PumpkinPi asks what a newly initialized Project should achieve and the owner replies, “Use the design documents already drafted,” the expected behavior is:
+For example, when PumpkinPie asks what a newly initialized Project should achieve and the owner replies, “Use the design documents already drafted,” the expected behavior is:
 
 1. treat the documents as referenced context for initial intent;
 2. inspect them without changing Project files;
@@ -161,7 +161,7 @@ For example, when PumpkinPi asks what a newly initialized Project should achieve
 
 ## Realization Is Reconciliation
 
-When situated work is authorized, PumpkinPi does not send the whole Source of Intent to one Run and equate the Run's response with completion. It starts or resumes a reconciliation operation against a specific intent revision.
+When situated work is authorized, PumpkinPie does not send the whole Source of Intent to one Run and equate the Run's response with completion. It starts or resumes a reconciliation operation against a specific intent revision.
 
 ```text
 Load active intent revision
@@ -201,7 +201,7 @@ A broad project definition is governing context, not itself an executable prompt
 
 ### Inspection Before Change
 
-PumpkinPi must have enough current evidence to choose a bounded objective safely. Existing evidence may be reused if its freshness and scope are adequate. Otherwise an inspection Run precedes implementation.
+PumpkinPie must have enough current evidence to choose a bounded objective safely. Existing evidence may be reused if its freshness and scope are adequate. Otherwise an inspection Run precedes implementation.
 
 ### Validation After Change
 
@@ -220,11 +220,11 @@ Run results return to the orchestrator, not directly to the primary timeline as 
 - whether a consequential decision is needed;
 - what the next bounded increment should address.
 
-Only then does PumpkinPi promote a user-facing incremental outcome or proceed to review.
+Only then does PumpkinPie promote a user-facing incremental outcome or proceed to review.
 
 ### Independent whole-Project review
 
-After each implementation/validation increment, and whenever reality may already conform, PumpkinPi runs a reviewer role that is independent of the implementing Run. The reviewer receives the complete current Source of Intent, relevant Project reality, prior findings, and verifiable evidence. It inspects the whole Project against the whole intent revision, not merely the latest diff or bounded objective.
+After each implementation/validation increment, and whenever reality may already conform, PumpkinPie runs a reviewer role that is independent of the implementing Run. The reviewer receives the complete current Source of Intent, relevant Project reality, prior findings, and verifiable evidence. It inspects the whole Project against the whole intent revision, not merely the latest diff or bounded objective.
 
 The reviewer returns a typed result:
 
@@ -233,7 +233,7 @@ The reviewer returns a typed result:
 - checks performed and relevant scope not inspected;
 - `approved` only when it found no fault and no required scope remained unreviewed.
 
-Reviewer findings become durable divergences and feed the next implementation iteration. PumpkinPi does not impose a success-oriented iteration limit. Context, cost, or policy limits may checkpoint and pause the loop, but the Project remains unsatisfied and resumes later.
+Reviewer findings become durable divergences and feed the next implementation iteration. PumpkinPie does not impose a success-oriented iteration limit. Context, cost, or policy limits may checkpoint and pause the loop, but the Project remains unsatisfied and resumes later.
 
 The reviewer cannot make approval easier by weakening or rewriting the Source of Intent. Proposed intent changes return to Intent Chat as explicit proposals. Disputed, contradictory, or unevaluable findings trigger further inspection or an owner question rather than being silently discarded.
 
@@ -243,13 +243,13 @@ Iteration throughput must be improved without narrowing active intent, skipping 
 
 ### Derived requirement graph
 
-The Spoke compiles each exact Source of Intent revision into a disposable, content-addressed requirement graph. Every node has a stable ID, exact source document and line range, source hash, kind, dependencies where known, and acceptance criteria where present. The authoritative document bytes remain canonical; the graph never replaces, weakens, or resolves ambiguity in them. A node must be traceable to exact source bytes, graph generation is keyed by the complete Source hash, and any graph omission leaves scope unreviewed rather than deleting the requirement.
+The Slice compiles each exact Source of Intent revision into a disposable, content-addressed requirement graph. Every node has a stable ID, exact source document and line range, source hash, kind, dependencies where known, and acceptance criteria where present. The authoritative document bytes remain canonical; the graph never replaces, weakens, or resolves ambiguity in them. A node must be traceable to exact source bytes, graph generation is keyed by the complete Source hash, and any graph omission leaves scope unreviewed rather than deleting the requirement.
 
 Agents may use the graph to avoid repeatedly rediscovering document structure. Approval still requires complete path/hash coverage of the authoritative bundle and an assessment of every applicable requirement node.
 
 ### Durable divergence ledger
 
-Reviewer findings reconcile into a Spoke-authoritative divergence ledger rather than becoming an unrelated prose list on every iteration. A divergence records a stable ID and fingerprint, governing requirement IDs, affected components, first and latest observed reality versions, state, attempt and reopen counts, evidence, verification criteria, and suggested objectives.
+Reviewer findings reconcile into a Slice-authoritative divergence ledger rather than becoming an unrelated prose list on every iteration. A divergence records a stable ID and fingerprint, governing requirement IDs, affected components, first and latest observed reality versions, state, attempt and reopen counts, evidence, verification criteria, and suggested objectives.
 
 The lifecycle is:
 
@@ -260,7 +260,7 @@ open -> addressed -> verified
   +------- reopened <- regression
 ```
 
-The Spoke matches findings to existing divergences by stable requirement identity and normalized fault identity, retains history, rejects duplicate identities within one review, and records unmatched complete-review findings as new. Absence from an incomplete review never closes a divergence. A complete current review may verify a previously open divergence as absent; whole-Project satisfaction still requires the separate zero-finding approval rules.
+The Slice matches findings to existing divergences by stable requirement identity and normalized fault identity, retains history, rejects duplicate identities within one review, and records unmatched complete-review findings as new. Absence from an incomplete review never closes a divergence. A complete current review may verify a previously open divergence as absent; whole-Project satisfaction still requires the separate zero-finding approval rules.
 
 Each iteration reports opened, still-open, verified, and reopened counts. Finding wording or ordering must not erase history. Repeated or reopened divergences trigger root-cause analysis rather than indefinite local patching.
 
@@ -268,7 +268,7 @@ Each iteration reports opened, still-open, verified, and reopened counts. Findin
 
 Bounded does not mean one finding. The orchestrator selects a coherent objective package from the ledger when findings share a subsystem, root cause, schema migration, security boundary, dependency, or validation fixture. The package remains small enough to implement and validate coherently, but should maximize requirements unblocked, divergences closed, risk reduced, and reusable evidence gained.
 
-Objective selection is Spoke-controlled and records its divergence IDs, requirements, scope, validation criteria, authorization basis, and rationale. The implementation Run may propose a safer decomposition but may not silently discard assigned divergences. Reopened findings and architectural blockers receive higher priority. Every resulting checkpoint still receives independent whole-Project review.
+Objective selection is Slice-controlled and records its divergence IDs, requirements, scope, validation criteria, authorization basis, and rationale. The implementation Run may propose a safer decomposition but may not silently discard assigned divergences. Reopened findings and architectural blockers receive higher priority. Every resulting checkpoint still receives independent whole-Project review.
 
 ### Content-addressed observations and evidence reuse
 
@@ -278,29 +278,29 @@ Reuse does not make review partial: every requirement must bind either to a curr
 
 ### Validation execution and assessment
 
-Known deterministic validation obligations are issued by the Spoke and executed by a supervised validation executor. It records the exact command, working directory, environment and toolchain fingerprint, start and finish times, exit status, signal, cancellation, output digest, retained output, and checkpoint. Independent validation or review agents assess this evidence and may request additional checks; they need not spend a model turn merely waiting for a known command.
+Known deterministic validation obligations are issued by the Slice and executed by a supervised validation executor. It records the exact command, working directory, environment and toolchain fingerprint, start and finish times, exit status, signal, cancellation, output digest, retained output, and checkpoint. Independent validation or review agents assess this evidence and may request additional checks; they need not spend a model turn merely waiting for a known command.
 
 Implementation, validation, and review must not unknowingly repeat an identical expensive command for the same validity key. Deliberate independent reruns remain permitted and are required where policy says execution provenance is material. Validation commands may be scheduled concurrently only when declared resource locks and isolation make their results deterministic.
 
 ### Persistent independent role Sessions
 
-A realization operation maintains resumable role-specific Pi Sessions for implementation and review. Reviewer state is never shared with the implementer. Sessions retain repository understanding, prior attempts, and compacted typed state across iterations, with every retained observation bound to the Source revision and Project hash that made it valid. Restart restores the durable typed state and revalidates bindings before reuse.
+A realization operation maintains resumable role-specific native Sessions for implementation and review. Reviewer state is never shared with the implementer. Sessions retain repository understanding, prior attempts, and compacted typed state across iterations, with every retained observation bound to the Source revision and Project hash that made it valid. Restart restores the durable typed state and revalidates bindings before reuse.
 
 Reviewer independence does not require amnesia. A warm reviewer may retain the previous complete assessment and ledger, but final approval requires a cold complete review, or another policy-defined independent approval quorum, to counter anchoring and accumulated blind spots. Review Sessions are rotated after intent changes, material policy changes, context integrity failures, or configured risk triggers.
 
 ### Complete review coordination
 
-Whole-Project review may be partitioned into concurrent requirement domains when a Spoke-controlled coordinator proves complete, non-overlapping-or-explicitly-overlapping coverage and reconciles cross-domain findings. Parallel subreviewers are all read-only and independent from implementation. Their aggregate cannot approve unless every requirement and issued obligation is covered, all findings are reconciled, and no required scope remains unreviewed.
+Whole-Project review may be partitioned into concurrent requirement domains when a Slice-controlled coordinator proves complete, non-overlapping-or-explicitly-overlapping coverage and reconciles cross-domain findings. Parallel subreviewers are all read-only and independent from implementation. Their aggregate cannot approve unless every requirement and issued obligation is covered, all findings are reconciled, and no required scope remains unreviewed.
 
 Intermediate reviews emphasize changed impact, previous divergence verification, and complete requirement coverage. Approval review is cold and exhaustive. Both remain whole-Project reviews and both can discover faults anywhere; the distinction changes attention and evidence freshness policy, not satisfaction semantics.
 
 ### Build and tool cache policy
 
-Situated execution may use bounded content-addressed build caches shared across isolated worktrees. Cache identity includes Project, toolchain, lockfile, target, profile, features, relevant environment, and policy version. Cache contents are never promoted as Project source, cannot bypass validation, and are discarded when identity is uncertain. The Spoke enforces size and retention limits and removes caches and worktrees belonging only to terminal superseded operations.
+Situated execution may use bounded content-addressed build caches shared across isolated worktrees. Cache identity includes Project, toolchain, lockfile, target, profile, features, relevant environment, and policy version. Cache contents are never promoted as Project source, cannot bypass validation, and are discarded when identity is uncertain. The Slice enforces size and retention limits and removes caches and worktrees belonging only to terminal superseded operations.
 
 ### Iteration telemetry and non-convergence
 
-The Spoke durably records phase wall time, model and tool time, provider usage where available, prompt/context bytes, cache hits, commands, build time, changed files, checkpoint, and divergence transitions. Telemetry is diagnostic evidence, not satisfaction evidence, and secrets are redacted before persistence or transport.
+The Slice durably records phase wall time, model and tool time, provider usage where available, prompt/context bytes, cache hits, commands, build time, changed files, checkpoint, and divergence transitions. Telemetry is diagnostic evidence, not satisfaction evidence, and secrets are redacted before persistence or transport.
 
 The orchestrator detects non-convergence such as repeated findings, reopened faults, validation oscillation, high-cost iterations with no verified divergence, or repeated edits to the same boundary. It responds by selecting root-cause work, changing decomposition, rotating an independent reviewer, obtaining missing inspection, or asking the owner about contradictory intent. It never responds by declaring success, suppressing findings, or silently reducing complete review.
 
@@ -397,7 +397,7 @@ ReviewResult
 
 The actual protocol may use richer enums and records, but it must preserve these distinctions. It must not use an `execute: bool` plus free-form `work_request` as the governing orchestration contract.
 
-All model-produced values are untrusted proposals. The Spoke validates IDs, revision binding, allowed transitions, requested scope, authorization, evidence references, and policy before changing durable state or launching work.
+All model-produced values are untrusted proposals. The Slice validates IDs, revision binding, allowed transitions, requested scope, authorization, evidence references, and policy before changing durable state or launching work.
 
 ## Concurrency and Intent Changes
 
@@ -412,11 +412,11 @@ When intent changes:
 5. mark all returned claims and evidence with their actual revision;
 6. never promote stale results as satisfying current intent.
 
-Cancellation propagates from a visible operation to its pending actions, child Runs, queued Pi commands, and eventual timeline state.
+Cancellation propagates from a visible operation to its pending actions, child Runs, provider streams, queued or active native tools, interactions, and eventual timeline state.
 
 ## Questions and Human Supervision
 
-PumpkinPi asks the owner when:
+PumpkinPie asks the owner when:
 
 - intent is insufficient to choose safely;
 - a consequential interpretation lacks authorization;
@@ -426,11 +426,11 @@ PumpkinPi asks the owner when:
 - evidence cannot support a requested conclusion;
 - continuing realization would violate Source of Intent constraints or Project policy.
 
-Questions should be focused and explain why the answer matters. PumpkinPi should not ask the owner to decide internal orchestration details it can safely determine itself.
+Questions should be focused and explain why the answer matters. PumpkinPie should not ask the owner to decide internal orchestration details it can safely determine itself.
 
 ## Durable Records
 
-The Spoke-authoritative Project state must retain enough structure to reconstruct why work occurred and what it established:
+The Slice-authoritative Project state must retain enough structure to reconstruct why work occurred and what it established:
 
 - canonical Source of Intent revisions and hashes;
 - Intent Chat items and decisions;
@@ -442,11 +442,11 @@ The Spoke-authoritative Project state must retain enough structure to reconstruc
 - reviewer findings, review coverage, approvals, and satisfaction assessments;
 - questions, cancellations, supersession, and stale results.
 
-Hub caches and Client projections do not become authoritative merely because the Spoke is offline.
+Hub caches and Slice GUI projections do not become authoritative merely because the Slice is offline.
 
 ## Failure and Recovery
 
-If interpretation, inspection, implementation, or validation fails, PumpkinPi records the failure at the correct layer.
+If interpretation, inspection, implementation, or validation fails, PumpkinPie records the failure at the correct layer.
 
 - Intent proposal failure leaves canonical intent unchanged.
 - Inspection failure leaves observations unknown and explains why intent assembly or realization is blocked.
@@ -460,7 +460,7 @@ If interpretation, inspection, implementation, or validation fails, PumpkinPi re
 
 ### Broad existing design during initialization
 
-Given a repository containing extensive design documents and a Project awaiting initial intent, when the owner says, “Use the design documents already drafted,” then PumpkinPi:
+Given a repository containing extensive design documents and a Project awaiting initial intent, when the owner says, “Use the design documents already drafted,” then PumpkinPie:
 
 - inspects all relevant design material;
 - commits a comprehensive Source of Intent revision;
@@ -528,4 +528,4 @@ Intent orchestration is not ready to implement until executable contract tests c
 10. stale-revision and stale-approval handling;
 11. restart recovery between every phase.
 
-A deterministic fake agent and fake Pi process should prove these state transitions before real model behavior is used as evidence that the orchestration works.
+A deterministic Rust fake provider, scripted model stream, and fake tool executor must prove these state transitions before real model behavior is used as evidence that orchestration works.

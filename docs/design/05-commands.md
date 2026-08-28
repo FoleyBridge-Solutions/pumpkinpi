@@ -1,79 +1,64 @@
 # Commands
 
-## Command Boundary
+Commands are PumpkinPie/Slice domain types, never raw provider or external-agent commands.
 
-Normal Clients issue Project/Intent Chat commands. Session commands are an internal orchestration and diagnostics API. The public product must not require the user to create, name, attach to, or queue internal Sessions.
+## Product Commands
 
-## User-Facing Commands
-
-### Hub / Project Discovery
-
-```json
-{"type":"hub.status"}
-{"type":"spoke.list"}
-{"type":"project.list"}
-{"type":"project.get","spoke_id":"spoke_home","project_id":"proj_api"}
+```text
+hub.status
+slice.list/get/disable/revoke/rotate_key
+project.initialize/list/get/status/remove
+intent.send/subscribe/get_projection/cancel
+interaction.answer
+provider.list/set/revoke
+operation.cancel
 ```
 
-### Project Initialization
+Example:
 
 ```json
-{"type":"project.initialize","spoke_id":"spoke_home","cwd":"/home/me/app","name":"app"}
-{"type":"project.initialization_status","spoke_id":"spoke_home","project_id":"proj_app"}
-{"type":"project.remove","spoke_id":"spoke_home","project_id":"proj_app"}
+{"type":"intent.send","slice_id":"slice_home","project_id":"proj_app","message":"Make reconnect durable","expected_revision":4}
 ```
 
-Initialization inspects local context and opens Intent Chat to assemble the initial Source of Intent. It is a lifecycle, not a single synchronous directory-registration call.
+`intent.send` may clarify/correct/adopt/prioritize/pause/resume intent or request a projection. The serialized Intent Agent proposes typed acts/actions; Slice validates and commits.
 
-### Intent Chat
+## Local Slice Commands
 
-```json
-{"type":"intent.send","spoke_id":"spoke_home","project_id":"proj_app","message":"The CLI should support JSON output"}
-{"type":"intent.cancel","spoke_id":"spoke_home","project_id":"proj_app","operation_id":"op_123"}
-{"type":"intent.subscribe","spoke_id":"spoke_home","project_id":"proj_app","cursor":"42"}
-{"type":"intent.get_projection","spoke_id":"spoke_home","project_id":"proj_app","projection":"summary"}
+Standalone/local IPC additionally supports:
+
+```text
+session.start/resume/list/archive/export
+interactive.prompt/cancel
+realization.start/pause/resume/cancel
+project.trust/policy
+runtime.doctor
 ```
 
-`intent.send` may clarify intent, update the Source of Intent, initiate work, answer a question, or request an explanation. The Intent Agent interprets the message in Project context; the user need not choose an internal command category.
+These use the same operation/event machinery and cannot bypass Project policy.
 
-`intent.get_projection` asks an LLM to render canonical Source of Intent state into a human-readable summary, explanation, diff, or other supported projection. It does not expose canonical storage as the normal UI.
+## Native Runtime Commands
 
-## Internal Session Commands
+Internal typed commands include start/resume turn, cancel, submit interaction response, request compaction, and inspect redacted state. Model tool calls are not Session commands; they pass through tool schema/policy and become durable ToolCall records.
 
-Internal commands include Session create/list/subscribe/stop/restart/delete/send and full routing metadata. They are used by PumpkinPi orchestration and diagnostics, not ordinary Intent Chat UI.
+No command switches an opaque external session binding. Session resume/fork/archive are Slice-owned transactions over native SQLite events/context.
 
-The Session payload uses PumpkinPi command types translated by the Spoke into documented Pi RPC commands, including prompt/steer/follow-up, abort/clear queue, model/settings/state queries, direct bash, session stats, entry retrieval, extension UI responses, and compaction/retry controls.
+## Queueing
 
-Pi commands that mutate internal Session binding (`new_session`, `switch_session`, `fork`, `clone`) remain denied unless a PumpkinPi wrapper atomically updates the Session registry.
+Each Session serializes model turns. Priority order is:
 
-Danger is not limited to direct RPC `bash`: prompts can induce tools, extensions can execute immediately, and skills/templates can change behavior. UX, evidence, and audit should distinguish direct bash, agent tool execution, extension commands, and prompt/skill expansion.
+1. cancellation/abort and process kill deadline;
+2. interaction answer;
+3. owner steering explicitly allowed by mode;
+4. current-turn continuation/tool result;
+5. ordinary prompt;
+6. background compaction/maintenance.
 
-## Intent Revision Semantics
+Project and Slice concurrency/resource limits are enforced before Run start. Queue admission and rejection are durable and visible when they affect user work.
 
-Operations that implement or validate intent record the Source of Intent revision they target.
+## Validation
 
-If a newer revision appears:
+Before execution Slice validates protocol version, route/Project ownership, IDs, expected Source revision, operation state, trust/policy, purpose/tool policy, provider capability, effective identity, queue limit, deadline, and schema/size limits. Unknown commands and fields at authority boundaries are rejected.
 
-- harmless inspection may continue and report its revision
-- implementation/validation must be assessed for staleness
-- incompatible work should be cancelled or superseded
-- outcomes must not be claimed against a revision they did not evaluate
+## Cancellation
 
-Source of Intent writes use optimistic revision checks or equivalent atomic serialization to prevent lost updates.
-
-## Per-Session Queue Priority
-
-Internal commands are serialized per Session, but cancellation and UI responses must not wait behind normal work:
-
-1. lifecycle/emergency stop and process cleanup
-2. blocking `extension_ui_response`
-3. cancellation: abort bash/retry, clear queue, abort
-4. normal prompts, steering, settings, queries, and bash
-
-Rules:
-
-- UI responses are valid only for pending request IDs.
-- “Stop everything” clears queued continuations before aborting active work.
-- stop attempts graceful shutdown then kills after timeout.
-- ordinary commands are rejected for crashed, missing, stopped, or stale Sessions.
-- cancelling an internal Run must produce a coherent visible outcome in Intent Chat when it originated from user intent.
+Cancellation targets an operation and propagates to objective, Runs, provider streams, queued/active tools, interactions, and timeline. Graceful child termination is bounded, then process groups are killed. Late provider/tool output is stale diagnostic input only.

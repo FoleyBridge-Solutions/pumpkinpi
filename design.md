@@ -1,4 +1,4 @@
-# PumpkinPi Design
+# PumpkinPie Design
 
 The design specification has been split into focused documents under [`docs/design/`](docs/design/).
 

@@ -1,76 +1,70 @@
-# Persistence
+# Persistence and Reconciliation
 
-### Spoke Storage
+## Slice Authority
 
-```text
-/root/.pumpkinpi-spoke/
-  config.toml
-  spoke.key
-  projects.json
-  sources-of-intent/
-  intent-chats/
-  sessions.json
-  evidence/
-  logs/
-```
+Each Slice uses SQLite in WAL mode as authoritative structured storage. It persists Slice identity/binding, Projects/trust/policy, Source revisions and bundles, Intent Chats/timelines, operations/objectives, Sessions/Runs/events, tool calls, interactions, evidence/artifacts, divergences/reviews, workspaces, provider account references, inventory revision, audit, and recovery state.
 
-Sensitive files should be `0600` where supported.
+Large immutable bytes such as authoritative bundles, complete command output, file chunks, and exports may use a content-addressed artifact directory referenced transactionally from SQLite. Artifacts are written/hash-verified before committed references; orphan cleanup is recoverable.
 
-Spoke storage is root-owned when the Spoke daemon runs as root.
+No Redis, Hub connection, Node runtime, or external agent session store is required.
 
-Spoke stores:
+## Hub Authority
 
-- spoke id
-- hub URL
-- private key or spoke credential
-- Project registry and initialization state
-- canonical Source of Intent payloads, revisions, and hashes
-- durable Intent Chat timeline/cursors
-- internal Session/Run metadata and intent revision bindings
-- evidence and promoted outcomes
-- last known Pi session file paths
+Hub SQLite persists owner-control credentials used by `slice gui`, Slice enrollment/public keys/status, encrypted provider accounts and key metadata, routing/subscription metadata, redacted audit, and explicitly stale-able caches of Slice inventories/snapshots. Hub cache never becomes Source/Project/execution authority.
 
-### Hub Storage
+## Slice UI State
 
-The personal Hub database stores:
+Standalone TUI and `slice gui` persist separate non-authoritative preferences. GUI state includes owner-control credential reference, Hub URL, selection, drafts, cursors, recent remote Projects, subscription intent, and diagnostics. TUI state includes local selection, drafts, recent local Projects/Sessions, and display preferences. Neither replaces serve/TUI Project authority. Secrets use protected references.
 
-```text
-owner identity and recovery metadata optional
-client credentials
-spokes
-spoke_enrollment_keys
-spoke_public_keys / spoke_tokens
-provider accounts / encrypted credentials
-provider usage/preferences metadata
-project provider/model defaults
-Project metadata and initialization snapshots
-Source of Intent availability/revision metadata and permitted encrypted cache
-Intent Chat projections/timeline cache
-internal Session/Run metadata snapshots
-recent Projects/work and Client preferences
-audit log
-```
+## Transactions
 
-The initial schema does not include sharing grants or tenant membership. Multiuser support will be designed together with multitenancy.
+Authority transitions are SQLite transactions with explicit expected state/revision. Filesystem transitions use prepared records and idempotent reconciliation:
 
-Hub should hash setup keys and bearer tokens if bearer tokens are used.
+- Source commit retains previous revision/artifact before current pointer advances;
+- accepted user message and operation persist before acknowledgement;
+- tool intent persists before consequential execution and result afterward;
+- checkpoint commit records Git identity before review phase advances;
+- approval and promotion use a prepared/promoting/promoted protocol recoverable across crash;
+- cursor and inventory revisions are monotonic counters.
 
-Hub metadata snapshots are caches, not source of truth. Spoke inventory messages should include monotonically increasing revision numbers or timestamps so the Hub can reconcile stale projects/sessions after reconnects, deletions, renames, crashes, and offline periods.
+Atomic rename without fsync/schema/recovery is insufficient for authority.
 
-## Reconciliation Rules
+## Schema Migration
 
-On Spoke reconnect or inventory refresh, the Spoke is authoritative for local Projects, canonical Source of Intent state, evidence, and internal Sessions on that Spoke unless a future explicit replication design says otherwise. The Hub reconciles caches using inventory revisions, Source of Intent revisions/hashes, timeline cursors, and per-object timestamps.
+Every database has schema/application version. Migrations are ordered Rust code, transactional where SQLite permits, backed up when destructive, idempotence-tested, and fault-injected. Unsupported future versions fail safely. Corruption opens diagnostics/recovery without silently creating empty authority.
 
-Explicit cases:
+The prerelease PumpkinPie/Slice rename performs a one-time migration from legacy paths/fields. It does not retain a permanent dual API or dual writer.
 
-- **Spoke offline edits**: when a spoke reconnects, the Hub marks cached objects stale until fresh inventory arrives. Newer Spoke inventory wins over Hub cache for spoke-owned fields.
-- **Session deleted locally but cached by Hub**: if a session is absent from a complete inventory snapshot, the Hub marks its cached snapshot `stale` or `deleted_remote` and removes active subscriptions after notifying clients.
-- **Project path renamed/moved**: project identity is `project_id`, not `cwd`. If the Spoke reports the same `project_id` with a new `cwd`, the Hub updates the snapshot and emits `project.updated`. If the old path no longer exists and no replacement is reported, mark the project `missing`.
-- **Pi session file missing**: the Spoke marks the PumpkinPi session `missing`. The session remains listed for recovery/delete, but normal commands are rejected until the Pi file is restored or a wrapper intentionally creates a new Pi session binding.
-- **Source of Intent mismatch**: revision/hash disagreement freezes conflicting writes. PumpkinPi preserves both states, marks intent `conflicted`, and uses Intent Chat to explain/recover rather than silently choosing by timestamp.
-- **Source of Intent unavailable/corrupt**: ordinary intent-driven work is paused. Preserve last known human-readable projections and evidence, then offer repair/export diagnostics.
-- **Duplicate Project/Session names**: names are display labels only. IDs are authoritative. Clients disambiguate with Spoke and cwd where useful.
-- **Stale client subscriptions**: when a project/session becomes stale, deleted, revoked, or missing, the Hub sends a terminal subscription event and removes or suspends the subscription. Clients must not silently retarget a subscription by name.
+## Runtime Event Log
 
-A partial inventory must be marked as partial and must not delete missing cached objects. Only a complete inventory snapshot may cause Hub cache objects to become stale/deleted due to absence.
+Session events are append-only per Session sequence. Context checkpoints and projections are derived. Crash recovery uses durable event/phase boundaries, not a provider socket or external session file. Hidden chain-of-thought is not stored.
 
+Review evidence may journal append-only during active capture, then reconcile transactionally into evidence/artifact tables. Full-store rewrites per tool event are prohibited.
+
+## Reconciliation
+
+Slice inventory has a strictly monotonic revision and `complete` flag. Hub:
+
+- rejects stale/out-of-order inventory;
+- merges partial inventory without deleting omitted objects;
+- reconciles absence only from complete inventory;
+- marks cached state stale/offline on disconnect;
+- refreshes all snapshot fields without lossy merges.
+
+Slice GUI instances replay by durable cursor, deduplicate stable IDs, and receive explicit gaps when retained history cannot satisfy a cursor.
+
+## Retention
+
+Policy separately bounds diagnostics, provider raw fragments, command artifacts, caches, superseded worktrees, archived Sessions, and audit. Canonical Source revisions, owner messages/decisions, promotion/approval evidence, and unresolved recovery records are not deleted by ordinary cache cleanup.
+
+Build caches are disposable, content-addressed by complete validity identity, size-bounded, and never authority. Terminal workspace/branch/cache cleanup is recorded and retryable.
+
+## Failure Cases
+
+- missing/corrupt database or artifact: block affected authority, preserve diagnostics/backups, offer verify/export/repair;
+- Source mismatch/conflict: freeze canonical writes/realization and preserve both sides;
+- missing/corrupt worktree: block with checkpoint/base diagnostics;
+- interrupted promotion: reconcile prepared Git and database states idempotently;
+- missing context checkpoint: rebuild from Session events or mark blocked, never invent history;
+- Hub cache mismatch: defer to authenticated Slice inventory and retain visible stale/conflict state;
+- disk full/fsync failure: do not acknowledge authority transition.

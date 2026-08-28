@@ -1,212 +1,315 @@
 # Data Model
 
-### Personal Hub
+All IDs are stable opaque strings. Names are mutable human projections. Slice SQLite is authoritative for situated records; Hub storage is authoritative only for Hub accounts, enrollment, routing cache, and audit.
 
-The initial Hub belongs to one person. It remembers that person's connected Spokes, authenticated Clients, provider credentials, preferences, Projects, and recent Intent Chats/work.
+## Slice Serve Identity
 
-```text
-hub_id
-owner identity optional
-authenticated client credentials
-enrolled spokes
-client preferences
-recently used spokes/projects
-provider accounts / credentials
-provider usage/preferences metadata
-created_at
-updated_at
-```
-
-An owner identity may be used for login and recovery, but it is not a tenant or sharing boundary. Multiuser access will be designed together with multitenancy.
-
-The Hub should not store source files by default. Project contents remain on Spokes. Source of Intent, Intent Chat, and evidence may be cached by the Hub only according to explicit retention, confidentiality, and authority rules.
-
-### Spoke
+An enrolled/situated endpoint identity is created for `slice serve`; GUI-only use does not claim an endpoint identity.
 
 ```text
-spoke_id
-name
-hostname
-version
-status: offline | online | disabled | revoked
-capabilities
-created_at
-enrolled_at
-last_seen_at
-revoked_at
-public_key or token hash
+Slice
+  slice_id
+  name
+  hostname
+  version
+  public_key
+  status: unenrolled | online | offline | disabled | revoked
+  hub_binding optional
+  capabilities
+  policy_version
+  inventory_revision
+  created_at / enrolled_at / last_seen_at
 ```
 
-### Project
+One serve identity owns one local endpoint authority and can host many Projects. Standalone TUI may own local Projects without enrollment and can explicitly attach/migrate them to service authority; GUI state remains separate and non-authoritative.
 
-A Project is a trusted working environment on a Spoke, defined by a Source of Intent and primarily accessed through Intent Chat.
+## Project
 
 ```text
-project_id
-spoke_id
-name
-cwd
-source_of_intent_id
-intent_chat_id
-initialization_status: uninitialized | inspecting | clarifying | ready | failed
-default_pi_args
-default_provider optional
-default_model/settings optional
-run_as_user optional
-allow_root_sessions: bool
-status: active | missing | stale | removed
-trusted: bool
-created_at
-updated_at
+Project
+  project_id
+  slice_id
+  name
+  canonical_cwd
+  repository_root optional
+  branch/worktree metadata
+  source_of_intent_id
+  intent_chat_id
+  initialization_status
+  project_status
+  realization_status
+  trust_record
+  run_as_user
+  allow_root_sessions
+  provider_account_ref optional
+  default_provider/model
+  local_policy_hash
+  created_at / updated_at
 ```
 
-### Source of Intent
+Canonical path, filesystem identity, repository identity, and Slice identity prevent path-name ambiguity. A Project can be used through Slice TUI and PumpkinPie without duplication.
 
-The Source of Intent is canonical LLM-facing Project state. Its payload is deliberately representation-agnostic and does not need to be directly readable by users.
+## Source of Intent
 
 ```text
-source_of_intent_id
-spoke_id
-project_id
-format/version
-revision
-canonical_payload or storage_ref
-authoritative_bundle optional: manifest path, exact document bytes/paths/sizes/hashes, aggregate bundle hash
-content_hash covering payload and authoritative bundle
-status: absent | assembling | active | updating | conflicted | unavailable
-created_at
-updated_at
+SourceOfIntent
+  source_of_intent_id
+  project_id
+  revision
+  format/schema_version
+  generated_payload
+  authoritative_bundle optional
+  content_hash
+  status: absent | assembling | active | updating | conflicted | unavailable
+  previous_revision
+  created_at / updated_at
 ```
 
-Updates must be revisioned and atomic. An internal run should record which Source of Intent revision it was serving. Human-readable summaries and diffs are projections, not canonical truth.
+Every committed revision is retained or recoverably backed up. The authoritative bundle stores exact path, bytes/content-addressed artifact, byte length, individual hash, manifest closure, and aggregate hash. Generated payload supplements but cannot replace it.
 
-### Intent Chat
-
-Each Project has one primary Intent Chat with stable identity.
+## Requirement Graph
 
 ```text
-intent_chat_id
-spoke_id
-project_id
-source_of_intent_revision
-status: ready | waiting_for_user | updating_intent | working | blocked | stale
-created_at
-updated_at
-last_active_at
+RequirementIndex
+  project_id
+  source_revision/hash
+  generator_version
+  nodes[]
+  completeness_assessment
+  generated_at
+
+RequirementNode
+  requirement_id
+  exact source path/span/hash
+  kind
+  text projection
+  dependencies[]
+  acceptance_criteria[]
 ```
 
-The Intent Chat timeline contains user messages and LLM-generated projections: questions, decisions, progress, outcomes, evidence summaries, reviewer findings/approval, and explanations of Source of Intent changes.
+It is derived, disposable, and traceable to exact intent. Missing projection scope remains unreviewed.
 
-### Internal Session / Run
-
-An internal Session is one persistent LLM execution associated with a Project. It may serve intent maintenance, inspection, implementation, validation, independent review, or recovery. Pi-specific fields describe the current implementation and are not normal user-facing concepts.
+## Intent Chat and Timeline
 
 ```text
-session_id
-run_id optional
-spoke_id
-project_id
-purpose: intent | inspection | implementation | validation | review | recovery
-source_of_intent_revision optional
-parent_operation_id optional
-name internal
-cwd
-status: starting | idle | running | blocked | stopped | crashed | missing | stale
-run_as_user
-run_as_root: bool
-pi_session_id optional
-pi_session_file optional
-pi_leaf_id optional
-pi_session_name optional
-created_at
-updated_at
-last_active_at
+IntentChat
+  intent_chat_id
+  project_id
+  source_revision
+  status
+  next_cursor
+  created_at / updated_at / last_active_at
+
+TimelineItem
+  timeline_item_id
+  project_id / intent_chat_id
+  operation_id optional
+  session_id/run_id optional
+  source_revision optional
+  cursor
+  kind / visibility / status
+  summary / content
+  created_at / updated_at / completed_at
 ```
 
-Each active Session owns a Pi child process, IO readers/writer, command queue, subscribers, recent event buffer, state cache, lifecycle watcher, and restart policy.
+Primary items communicate intent, questions, outcomes, evidence, lifecycle, and failures. Detail/diagnostic items retain native runtime activity without making it the product mental model.
 
-### Timeline / Evidence
-
-Intent Chat has a normalized, replayable user-facing timeline. Internal Sessions have structured execution timelines that feed evidence and diagnostics.
+## Operation and Objective Package
 
 ```text
-timeline_item_id
-spoke_id
-project_id
-intent_chat_id optional
-session_id optional
-run_id optional
-source_of_intent_revision optional
-kind: user_intent | question | decision | intent_update | progress | outcome | evidence | tool_execution | extension_ui | lifecycle | error
-visibility: primary | detail | diagnostics
-status optional: queued | running | blocked | completed | failed | cancelled
-summary optional
-content optional
-raw_event_ref optional
-cursor / sequence
-created_at
-updated_at
-completed_at optional
+Operation
+  operation_id / request_id
+  project_id / intent_chat_id
+  targeted source revision
+  kind / authorization_basis
+  status
+  error/recovery
+  created_at / updated_at / completed_at
+
+ObjectivePackage
+  objective_id
+  operation_id / source revision
+  divergence_ids[] / requirement_ids[]
+  objective / scope[]
+  validation_criteria[]
+  rationale / authorization_basis
+  state
 ```
 
-Raw internal activity should not automatically flood Intent Chat. PumpkinPi promotes only information useful for intent, decision, trust, outcome, or recovery.
+User operations and Project realization are separate lifecycles. The orchestrator, not an implementation model, selects and persists bounded objectives.
 
-### Review / Satisfaction Assessment
+## Native Session and Run
 
-Independent review assesses complete observed Project reality against a complete current Source of Intent revision. Findings drive further realization; only approval with no findings and no required scope left unreviewed establishes satisfaction.
+A Session is a persistent role-specific model/tool context. A Run is one bounded turn/attempt within it.
 
 ```text
-assessment_id
-spoke_id
-project_id
-source_of_intent_revision
-observed_reality_version
-review_run_id
-reviewed_scope
-checks
-findings
-supporting_evidence_ids
-unreviewed_required_scope
-verdict: findings | approved
-status: current | stale
-created_at
-updated_at
+Session
+  session_id
+  project_id
+  purpose: intent | inspection | implementation | validation | review | approval_review | recovery | interactive
+  source_revision optional
+  parent_operation_id optional
+  provider_account_ref / provider / model
+  effective_user/root
+  context_checkpoint_id optional
+  status: starting | idle | running | blocked | stopped | crashed | missing | stale
+  created_at / updated_at
+
+Run
+  run_id / session_id
+  purpose / source_revision / reality_version
+  objective_id optional
+  output_contract_version
+  tool_policy_hash
+  event range
+  structured_result optional
+  usage
+  stop_reason / crash_record_id optional
+  started_at / completed_at
 ```
 
-Any material intent or Project-reality change makes incompatible approval stale.
+There are no external-agent session IDs/files or language-runtime fields.
 
-### Command / Operation
-
-A command is a user or system operation with a lifecycle. One high-level intent operation may create many internal commands and Sessions.
+## Native Session Events
 
 ```text
-operation_id
-origin_client_id optional
-origin_request_id optional
-spoke_id
-project_id optional
-intent_chat_id optional
-session_id optional
-type
-source_of_intent_revision optional
-status: queued | accepted | running | blocked | completed | failed | cancelled | rejected | unknown
-error optional
-created_at
-updated_at
-completed_at optional
+SessionEvent
+  event_id / session_id / run_id
+  sequence
+  type
+  correlation_id optional
+  typed payload or redacted artifact reference
+  visibility
+  created_at
 ```
 
-Every user-visible action that mutates intent or remote state should have an operation/timeline record so Intent Chat can acknowledge and explain it.
+Types include model lifecycle/deltas, tool requested/started/progress/completed, interaction, retry/rate limit, compaction, usage, cancellation, crash, and structured result. Hidden reasoning content is not durably stored.
 
-### Client
+## Tool Call and Artifact
 
 ```text
-client_id
-connection_id
-credential_id
-project_subscriptions
-connected_at
-last_seen_cursors
+ToolCall
+  tool_call_id / run_id
+  tool name/version
+  typed arguments
+  policy decision
+  status
+  requested/started/completed timestamps
+  result_artifact_id optional
+  evidence_ids[]
+
+Artifact
+  artifact_id
+  kind / media_type
+  content_hash / byte_len
+  storage_path
+  redaction/retention class
+  created_at
 ```
 
-One Client may subscribe to many Project Intent Chats across many Spokes, and each Intent Chat may have many observing Clients. Internal Session subscriptions are implementation/diagnostic subscriptions rather than the primary Client model.
+Large command output and file chunks live in content-addressed artifacts referenced transactionally from SQLite.
+
+## Evidence
+
+```text
+Evidence
+  evidence_id
+  project_id / run_id / tool_call_id optional
+  source_revision / reality_version / checkpoint
+  kind
+  subject
+  validity_key
+  content/output hash
+  capture metadata
+  success/exit/signal/cancellation
+  artifact references
+  observed_at
+```
+
+Evidence is Slice-captured. Model prose can cite evidence but cannot manufacture it.
+
+## Divergence and Review
+
+```text
+Divergence
+  divergence_id / fingerprint
+  project_id / source revision
+  requirement_ids[] / affected components[]
+  state: open | addressed | verified | reopened | superseded
+  fault / evidence_ids[] / verification_criteria[]
+  attempt/reopen counts
+  first/last reality
+  created_at / updated_at
+
+Review
+  review_id / run_id
+  project_id / source revision / reality version
+  scope
+  obligations[] / obligation evidence bindings[]
+  requirement coverage
+  findings/divergence transitions
+  unreviewed_required_scope[]
+  verdict: findings | approved
+  reviewer_context: warm | cold
+  created_at
+```
+
+Only a current cold complete approval with zero findings and no unreviewed scope can satisfy the Project.
+
+## Workspace
+
+```text
+Workspace
+  workspace_id / operation_id / project_id
+  primary root/cwd
+  isolated root/cwd
+  branch
+  base/checkpoint commits
+  status: active | approved | promoting | promoted | failed | removed
+  cache identity
+  created_at / updated_at
+```
+
+Promotion and recovery are transactional/idempotent. Terminal workspaces and bounded caches have explicit retention/cleanup.
+
+## Interaction
+
+```text
+Interaction
+  interaction_id
+  project/session/run/tool correlation
+  method
+  typed payload/schema
+  blocking
+  timeout/deadline
+  status
+  accepted response/client
+  created_at / resolved_at
+```
+
+The first valid response wins; duplicates and stale responses are rejected.
+
+## Provider Account
+
+Hub and local Slice accounts share product-level metadata but separate custody:
+
+```text
+ProviderAccount
+  provider_account_id
+  provider_id / label
+  auth_type
+  encrypted secret or external credential reference
+  capabilities/scopes
+  status / expiry
+  created_at / rotated_at / revoked_at
+```
+
+Runtime delivery uses a scoped in-memory capability. Tool subprocesses never receive it.
+
+## Slice GUI State
+
+`slice gui` persists non-authoritative owner-control credential reference, selection, recent Projects, drafts, cursors, subscription intent, GUI preferences, and redacted diagnostics. This state is separate from TUI/serve authority even when modes share one installation. Every cache records freshness and authority origin.
+
+## Schema and Time
+
+SQLite schemas and wire protocols are explicitly versioned and migrated transactionally. Durable ordering uses monotonic per-stream sequence/cursor plus timestamps; wall-clock timestamps alone never determine causality or inventory revision.

@@ -1,91 +1,104 @@
 # Responsibilities
 
-## Product Boundary
+The owner maintains intent and makes consequential decisions. PumpkinPie owns durable representation, orchestration, evidence, and user-visible outcomes. Slice performs situated native execution where Project reality lives.
 
-The user owns intent and decisions through a Project's Intent Chat. PumpkinPi owns the machinery that represents that intent, decomposes it into work, executes and validates work, and reports outcomes.
+## Hub
 
-Internal Sessions, runs, queues, commands, events, and agent topology are not normal user space.
+The personal Hub owns:
 
-### Hub Responsibilities
+- owner and independently revocable `slice gui` authentication;
+- Slice enrollment, challenge, key rotation, disable, revoke, and connection state;
+- encrypted provider-account custody, selection metadata, and scoped delivery;
+- multiplexed GUI-control/serve-endpoint routing and request correlation;
+- revisioned complete/partial Slice inventory cache;
+- Project/Intent subscription routing, cursors, replay, and stale projections;
+- redacted administrative audit;
+- connection-level rate and abuse controls.
 
-The personal Hub is the owner's unified point of presence and the system's control plane.
+The Hub does not own Project files, local execution policy, live native Sessions, tool processes, evidence capture, canonical Source commits, or satisfaction decisions.
 
-It owns:
+## Slice
 
-- owner and Client authentication
-- Spoke authentication and enrollment
-- Spoke presence
-- Client connections
-- Spoke/Client routing
-- Project and Intent Chat continuity/recent-work metadata
-- cached human-facing Project status
-- audit log
-- global preferences and cached metadata
+Slice is authoritative for:
 
-It does not execute internal Sessions and should not need access to Project files. It may retain encrypted/cached Source of Intent state or projections according to explicit persistence policy, but the authoritative location and availability semantics must be clear.
+- standalone TUI/CLI/service operation;
+- local Project initialization, canonical paths, trust, and policy;
+- Source of Intent revisions and exact authoritative bundles;
+- Intent Chat, timelines, operations, divergences, evidence, and review records;
+- native Rust Session/provider/model/tool runtime;
+- provider streaming, context checkpoints, compaction, retries, cancellation, and usage;
+- native tools, sandbox policy, process identity, writable surfaces, and command lifecycle;
+- isolated realization worktrees, checkpoints, rollback, validation, review, and promotion;
+- interaction requests/timeouts and local/remote answer correlation;
+- SQLite persistence, content-addressed artifacts, recovery, retention, and inventory publication;
+- reconciliation after restart or Hub reconnect.
 
-### Spoke Responsibilities
+Slice validates every model-produced proposal before authority changes or tools run.
 
-The Spoke daemon runs on a machine where Project reality exists.
+## Native Runtime
 
-It owns:
+The internal runtime owns mechanics, not product authority:
 
-- local Project registry
-- authoritative Source of Intent storage or durable synchronization endpoint
-- local trust policy
-- Project-context inspection during initialization
-- Pi RPC process lifecycle
-- internal Session / Run lifecycle
-- orchestration and per-Session command queues
-- implementation and validation execution
-- evidence collection
-- event fanout
-- Project/Session metadata snapshots
-- local persistence
-- outbound Hub connection
+- normalize provider capabilities and streams;
+- assemble tool calls and typed model output;
+- enforce per-turn output schema and tool policy;
+- execute approved calls through Slice supervisors;
+- persist typed events and independently captured results;
+- return structured proposals/evidence IDs to orchestration;
+- expose cancellation, usage, retry, compaction, and crash state.
 
-The Spoke is the source of truth for local filesystem/Project access and observed execution reality.
+It cannot commit Source of Intent, select authorization, promote worktrees, or mark satisfaction independently.
 
-### Intent Agent Responsibilities
+## Intent Orchestrator
 
-The logical Intent Agent behind Intent Chat owns:
+The Slice orchestrator owns:
 
-- interpreting user messages as proposed intent, questions, decisions, or requests
-- asking clarifying questions
-- reading and updating the Source of Intent
-- generating human-readable projections of the Source of Intent
-- deciding when intent is actionable
-- requesting or coordinating internal implementation/validation work
-- coordinating independent whole-Project review after each increment
-- turning every reviewer finding into durable divergence and another realization iteration
-- reconciling evidence and outcomes with intent
-- surfacing divergence, ambiguity, blockers, and consequential choices
-- declaring satisfaction only when current complete intent receives reviewer approval with no findings
+- serialized intent-maintenance lanes;
+- controlled context requests and inspection resumption;
+- Source proposal compare-and-swap, limits, exact coverage, and history;
+- activation/pause/resume/cancel and stale-work decisions;
+- requirement graph and durable divergence reconciliation;
+- convergence-oriented bounded objective packages;
+- implementation/validation/review phase transitions;
+- complete-review obligations, evidence validity, cold approval, and promotion;
+- recovery from every durable phase;
+- precise primary timeline projection.
 
-This role may be implemented using one or more internal Sessions. Its logical identity and continuity belong to the Project, not to a disposable process.
+## Slice TUI and Local CLI (`slice`)
 
-### Client Responsibilities
+The standalone coding-agent mode owns:
 
-Clients:
+- local Project/session discovery and selection;
+- conversation, streaming, tools, diffs, validation, and interactions;
+- situated identity/risk display before consequential work;
+- attach/detach to one Slice core through local IPC when service mode owns execution;
+- direct-checkout interactive policy versus isolated realization policy;
+- terminal-safe provider login and credential references;
+- diagnostics without exposing secrets or provider raw payloads.
 
-- authenticate to the personal Hub
-- list and select Projects across Spokes
-- present one primary Intent Chat per Project
-- send user intent and decisions
-- render human-readable summaries, questions, outcomes, evidence, and status
-- display situated context and safety cues
-- answer blocking interaction requests
-- reconnect and replay Project/Intent Chat history
-- expose internal runs, raw events, and diagnostics only as secondary detail
+It does not maintain a second local authority or bypass Slice policy.
 
-A Client is not bound to one Spoke or Project. A single Client connection multiplexes all Projects:
+## Slice GUI (`slice gui`)
 
-```text
-Client
-  ├─ home-laptop / app / Intent Chat
-  ├─ home-laptop / dotfiles / Intent Chat
-  ├─ work-desktop / backend / Intent Chat
-  └─ lab-server / experiments / Intent Chat
-```
+The graphical Client mode owns:
 
-Every command targeting work includes enough routing information, normally `spoke_id` and `project_id`; internal execution commands additionally carry `session_id` or `run_id`.
+- authenticated owner-control Hub connection and reconnect, distinct from serve endpoint identity;
+- Project/Slice discovery and selection;
+- Intent Chat input, immediate correlated optimistic state, and replay;
+- typed reducers for projects, sources, operations, interactions, reviews, divergence, and diagnostics;
+- offline/stale/conflict/recovery presentation;
+- provider/model/account administration through Hub APIs;
+- explicit situated safety context and cancellation/answer controls.
+
+GUI state caches projections/preferences but never becomes execution or canonical authority. Co-location with `slice serve` does not grant a direct authority bypass.
+
+## Owner
+
+The owner:
+
+- explains, corrects, and prioritizes intent;
+- adopts authoritative Project documents explicitly;
+- answers consequential questions;
+- chooses trust, provider accounts, execution identity, and exceptional capabilities;
+- may pause, cancel, resume, repair, export, or remove;
+- need not manage internal Sessions or approve every autonomous increment.

@@ -1,127 +1,106 @@
 # Protocol
 
-## Protocol Layers
+PumpkinPie has three typed transport roles and one internal native event boundary. There is no external-agent RPC layer.
 
-### Pi RPC Layer
+## Slice GUI–Hub Control Channel
 
-Pi RPC command example:
-
-```json
-{"id":"req-1","type":"prompt","message":"Fix tests"}
-```
-
-Pi RPC event example:
+Authenticated `slice gui` instances connect to the Hub with owner-control credentials over versioned HTTP/WebSocket APIs. One connection multiplexes commands/subscriptions across enrolled serve endpoints and Projects.
 
 ```json
-{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"..."}}
+{"protocol_version":4,"id":"req-1","type":"intent.send","slice_id":"slice_home","project_id":"proj_app","message":"Improve reconnect recovery","expected_revision":4}
 ```
 
-Pi RPC uses JSONL framing:
+Responses preserve the GUI request ID. Events carry authoritative creation time, stable object IDs, Project/Slice route, cursor/sequence where applicable, and typed payload.
 
-- one JSON object per LF-delimited line
-- split only on `\n`
-- strip optional `\r`
-- do not split on Unicode line separators
+## Hub–Slice Serve Endpoint Channel
 
-### PumpkinPi API / Envelope Layer
+An enrolled `slice serve` maintains an authenticated outbound WebSocket to the Hub using endpoint identity distinct from GUI owner credentials. The connection carries:
 
-PumpkinPi uses its own API between Clients, Hub, and Spokes. The Spoke is the Pi adapter: it translates PumpkinPi commands into Pi RPC commands, reads and understands Pi RPC events, updates Spoke-side session state, and sends only normalized PumpkinPi events/snapshots upstream.
+- challenge/authentication/key lifecycle;
+- heartbeat and capability/version negotiation;
+- monotonic revisioned complete/partial inventory;
+- routed typed commands with internal collision-safe correlation IDs;
+- Project snapshots and normalized events;
+- scoped provider capabilities only for Runs that require them;
+- cancellation and interaction answers.
 
-External PumpkinPi messages need routing metadata and protocol metadata.
+The Hub never forwards a GUI-chosen request ID as the sole internal correlation key. It creates a unique routed request identity and maps it back to GUI connection/external ID.
 
-All PumpkinPi envelopes should include or negotiate:
+## Local Slice IPC
+
+When `slice serve` owns active local execution, standalone Slice TUI/CLI may explicitly attach over authenticated local IPC using the same Slice command/event domain. Unix-domain sockets are preferred on Unix. Peer identity, socket permissions, protocol version, and runtime lease ownership are validated.
+
+Local IPC does not go through the Hub and remains available when unenrolled/offline.
+
+## Native Runtime Boundary
+
+The Slice orchestrator calls an in-process Rust runtime with typed requests/results/events. Provider HTTP payloads are private to provider modules. Raw provider events do not enter PumpkinPie wire protocols.
+
+```text
+orchestrator -> NativeTurnRequest -> runtime
+runtime -> SessionEvent / NativeTurnResult -> orchestrator
+```
+
+Unknown event/tool/output types are rejected by default. Redacted raw provider fragments may be retained only as bounded diagnostics.
+
+## Versioning
+
+Protocol version 4 is the destructive PumpkinPie/Slice rename and native-runtime contract. New APIs use `slice_id` and `Slice*` types; `spoke_id`, legacy executable names, and dual aliases are not retained in the normal API.
+
+Handshake negotiates exact required version plus optional capabilities. A peer with incompatible authority semantics is rejected explicitly, not interpreted best-effort.
+
+## Routing Envelope
+
+Every routed command includes:
 
 ```text
 protocol_version
-message id for request/response messages
-spoke_id / project_id when targeting user-visible Project work
-session_id / run_id when targeting internal execution
-source_of_intent_revision where relevant
-capabilities optional
+routed_request_id
+external request mapping retained only at Hub
+slice_id
+project_id where applicable
+operation_id where applicable
+source_revision where applicable
+command
+created_at/deadline
+scoped provider capability optional
 ```
 
-Unknown command types should be rejected by default. Raw Pi events should not be forwarded as the public PumpkinPi API. Unknown Pi event fields may be stored in Spoke diagnostics, but public Hub/Client events should remain normalized and versioned.
+Slice validates route ownership, current revision, authorization, policy, IDs, and command schema before acknowledging acceptance.
 
-Normal Client to Hub traffic targets Intent Chat rather than an internal Session:
+## Acknowledgement and Completion
 
-```json
-{
-  "id": "client-req-1",
-  "type": "intent.send",
-  "spoke_id": "spoke_home",
-  "project_id": "proj_api",
-  "message": "The failing tests should be fixed without changing public behavior"
-}
-```
+Transport acceptance, durable operation acceptance, and terminal outcome are distinct:
 
-PumpkinPi may translate this into Source of Intent updates and one or more internal Session commands. An internal Hub-to-Spoke command may look like:
+1. Hub acknowledges receipt/routing or correlated failure.
+2. Slice persists user message and operation, then returns `accepted`.
+3. Timelines/events communicate interpretation, progress, questions, outcomes, review, failure, or cancellation.
 
-```json
-{
-  "id": "hub-req-99",
-  "type": "session.send",
-  "project_id": "proj_api",
-  "session_id": "sess_tests",
-  "command": {
-    "type": "prompt",
-    "message": "Fix the failing tests"
-  }
-}
-```
+Slice GUI instances keep optimistic content visible until the matching durable timeline item is present or correlated failure marks it failed.
 
-Spoke to Pi:
+## Subscriptions and Replay
 
-```json
-{"type":"prompt","message":"Fix the failing tests"}
-```
+Subscriptions are Project/Intent based and resume from durable cursor. Snapshots include project, source metadata, chat, timeline, operations, reviews, divergences, requirement index metadata, interactions, telemetry, freshness, and replay-gap declaration.
 
-Pi to Spoke:
+Complete inventory may terminally reconcile absence; partial inventory never deletes omitted cache entries. Inventory revisions are strictly monotonic counters, not timestamps. Offline cache is projected explicitly stale.
 
-```json
-{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"..."}}
-```
+## Provider Capabilities
 
-Spoke to Hub:
+Provider secrets are not ordinary command fields. The Hub delivers an encrypted/scoped capability only for a native Run launch requiring that account. Slice keeps it in memory/provider storage policy, excludes it from events/logs/tools, and reports only account reference/provider/model/availability.
 
-```json
-{
-  "type": "session.output_delta",
-  "spoke_id": "spoke_home",
-  "project_id": "proj_api",
-  "session_id": "sess_tests",
-  "message_id": "msg_123",
-  "role": "assistant",
-  "delta": "..."
-}
-```
+## Interaction Correlation
 
-Hub forwards normalized PumpkinPi events to subscribed clients.
+Interaction requests carry interaction/session/run/tool/operation IDs, method, schema, deadline, and blocking state. Answers route to the exact pending interaction. Slice accepts the first valid answer and emits a terminal resolution; duplicates/stale answers receive correlated rejection.
 
-Because Clients can work across all enrolled Spokes simultaneously, the Hub must preserve the full routing envelope on every event. Clients should never infer target context from connection state alone. Primary Client events route by Project/Intent Chat; internal execution and diagnostic events additionally route by Session/Run.
+## Errors
 
-The Spoke should process Pi RPC events into PumpkinPi state and event types. For example, it should assemble assistant message deltas, treat Pi `message_end.message` as authoritative for the final message snapshot, translate tool/bash lifecycle events into stable PumpkinPi tool events, and emit session status changes such as `session.running`, `session.idle`, `session.crashed`, and `session.stopped`.
+Errors are typed by layer:
 
-## Client Multiplexing
+- transport/auth/version/routing;
+- stale revision or ownership;
+- policy/trust/identity;
+- provider/runtime/tool;
+- persistence/corruption/conflict;
+- unavailable/offline/replay gap.
 
-A Client connection is a multiplexed channel to all enrolled Spokes. The Client should be able to:
-
-- list every Spoke and Project it can access
-- subscribe to many Project Intent Chats concurrently
-- send intent to different Projects without separate connections
-- receive interleaved Project status/outcome events
-- correlate primary events by `spoke_id` and `project_id`
-- optionally inspect internal Sessions/Runs with their additional IDs
-- resume after reconnect using durable cursors where possible
-
-Example interleaved client workflow:
-
-```json
-{"id":"1","type":"intent.send","spoke_id":"spoke_home","project_id":"proj_app","message":"Make the test suite pass"}
-```
-
-```json
-{"id":"2","type":"intent.send","spoke_id":"spoke_work","project_id":"proj_backend","message":"Investigate this production error without deploying changes"}
-```
-
-The hub may route these commands to different spoke WebSockets concurrently. Responses and events from both sessions may arrive interleaved, so clients must demultiplex by envelope IDs.
-
+Normal GUI errors are concise and correlated. Detailed redacted diagnostics use secondary gated APIs.
