@@ -458,6 +458,7 @@ pub struct ReviewRecord {
     pub scope: ReviewScope,
     pub reviewed_scope: Vec<String>,
     pub checks: Vec<String>,
+    #[serde(default, alias = "supporting_evidence")]
     pub evidence: Vec<String>,
     /// Scope requirements issued by the Spoke before the independent Run began.
     #[serde(default)]
