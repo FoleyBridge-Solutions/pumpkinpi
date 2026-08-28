@@ -172,6 +172,14 @@ pub enum ReviewVerdict {
     Approved,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewScope {
+    BoundedObjective,
+    RequestedOutcome,
+    WholeProject,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpokeRecord {
     pub spoke_id: SpokeId,
@@ -361,8 +369,10 @@ pub struct ReviewRecord {
     pub run_id: RunId,
     pub source_of_intent_revision: u64,
     pub observed_content_hash: String,
+    pub scope: ReviewScope,
     pub reviewed_scope: Vec<String>,
     pub checks: Vec<String>,
+    pub evidence: Vec<String>,
     pub findings: Vec<ReviewFinding>,
     pub unreviewed_required_scope: Vec<String>,
     pub verdict: ReviewVerdict,
@@ -685,8 +695,12 @@ pub struct ImplementationRunResult {
 #[serde(deny_unknown_fields)]
 pub struct ReviewRunResult {
     pub source_coverage: Vec<DocumentCoverage>,
+    pub target_revision: u64,
+    pub observed_reality_version: String,
+    pub scope: ReviewScope,
     pub reviewed_scope: Vec<String>,
     pub checks: Vec<String>,
+    pub evidence: Vec<String>,
     pub findings: Vec<ReviewFindingProposal>,
     pub unreviewed_required_scope: Vec<String>,
     pub verdict: ReviewVerdict,
@@ -703,11 +717,32 @@ pub struct ReviewFindingProposal {
 
 impl ReviewRunResult {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.observed_reality_version.trim().is_empty() {
+            return Err("review requires an observed reality version");
+        }
+        if self
+            .reviewed_scope
+            .iter()
+            .any(|item| item.trim().is_empty())
+            || self.checks.iter().any(|item| item.trim().is_empty())
+            || self.evidence.iter().any(|item| item.trim().is_empty())
+        {
+            return Err("review scope, checks, and evidence cannot contain empty entries");
+        }
         match self.verdict {
             ReviewVerdict::Approved
                 if !self.findings.is_empty() || !self.unreviewed_required_scope.is_empty() =>
             {
                 Err("approval requires zero findings and no unreviewed required scope")
+            }
+            ReviewVerdict::Approved if self.scope != ReviewScope::WholeProject => {
+                Err("approval requires whole_project scope")
+            }
+            ReviewVerdict::Approved if self.reviewed_scope.is_empty() => {
+                Err("approval requires explicit reviewed scope")
+            }
+            ReviewVerdict::Approved if self.checks.is_empty() || self.evidence.is_empty() => {
+                Err("approval requires checks and supporting evidence")
             }
             ReviewVerdict::Findings if self.findings.is_empty() => {
                 Err("findings verdict requires at least one finding")

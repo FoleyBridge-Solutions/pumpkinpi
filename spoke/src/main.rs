@@ -1311,6 +1311,7 @@ async fn run_operation(
         let before_review = project_fingerprint(PathBuf::from(&execution_project.cwd)).await?;
         let prompt = orchestrator::review_prompt(
             machine.revision,
+            &before_review,
             &current_source.canonical_payload,
             &implementation,
             &authoritative_manifest,
@@ -1346,10 +1347,6 @@ async fn run_operation(
         let review: ReviewRunResult =
             serde_json::from_str(raw.trim()).context("review Run violated its typed contract")?;
         review.validate().map_err(anyhow::Error::msg)?;
-        source_bundle::validate_coverage(
-            current_source.authoritative_bundle.as_ref(),
-            &review.source_coverage,
-        )?;
         let record = persist_review(
             &state,
             &pid,
@@ -1493,6 +1490,27 @@ async fn set_realization_status(
     save_store(&state.data_dir, &store).await
 }
 
+fn validate_review_for_promotion(
+    result: &ReviewRunResult,
+    revision: u64,
+    observed_reality_version: &str,
+    authoritative_bundle: Option<&SourceOfIntentBundle>,
+) -> Result<()> {
+    result.validate().map_err(anyhow::Error::msg)?;
+    if result.target_revision != revision {
+        return Err(anyhow!(
+            "review targets Source of Intent revision {}, expected {revision}",
+            result.target_revision
+        ));
+    }
+    if result.observed_reality_version != observed_reality_version {
+        return Err(anyhow!(
+            "review observed reality version does not match independently verified Project reality"
+        ));
+    }
+    source_bundle::validate_coverage(authoritative_bundle, &result.source_coverage)
+}
+
 async fn persist_review(
     state: &State,
     project_id: &ProjectId,
@@ -1502,22 +1520,36 @@ async fn persist_review(
     expected_fingerprint: &str,
     result: &ReviewRunResult,
 ) -> Result<ReviewRecord> {
-    result.validate().map_err(anyhow::Error::msg)?;
     let observed_content_hash = project_fingerprint(observed_cwd.to_path_buf()).await?;
     if observed_content_hash != expected_fingerprint {
         return Err(anyhow!(
             "independent reviewer mutated Project reality; review rejected"
         ));
     }
+    let mut store = state.store.lock().await;
+    let source = store.sources.get(project_id).context("source missing")?;
+    if source.revision != revision || source.status != SourceStatus::Active {
+        return Err(anyhow!(
+            "review is stale for Source of Intent revision {revision}"
+        ));
+    }
+    validate_review_for_promotion(
+        result,
+        revision,
+        &observed_content_hash,
+        source.authoritative_bundle.as_ref(),
+    )?;
     let record = ReviewRecord {
         review_id: ReviewId(new_id("review")),
         spoke_id: state.config.spoke_id.clone(),
         project_id: project_id.clone(),
         run_id,
-        source_of_intent_revision: revision,
-        observed_content_hash,
+        source_of_intent_revision: result.target_revision,
+        observed_content_hash: result.observed_reality_version.clone(),
+        scope: result.scope.clone(),
         reviewed_scope: result.reviewed_scope.clone(),
         checks: result.checks.clone(),
+        evidence: result.evidence.clone(),
         findings: result
             .findings
             .iter()
@@ -1533,13 +1565,6 @@ async fn persist_review(
         verdict: result.verdict.clone(),
         created_at: now(),
     };
-    let mut store = state.store.lock().await;
-    let source = store.sources.get(project_id).context("source missing")?;
-    if source.revision != revision || source.status != SourceStatus::Active {
-        return Err(anyhow!(
-            "review is stale for Source of Intent revision {revision}"
-        ));
-    }
     store
         .reviews
         .insert(record.review_id.clone(), record.clone());

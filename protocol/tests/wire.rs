@@ -39,18 +39,30 @@ fn intent_agent_contract_rejects_prose_and_the_old_execute_shortcut() {
 }
 
 #[test]
-fn reviewer_cannot_approve_with_findings_or_unreviewed_scope() {
-    let invalid: ReviewRunResult = serde_json::from_str(
-        r##"{"source_coverage":[],"reviewed_scope":["workspace"],"checks":[],"findings":[{"requirement":"typed core","fault":"Value leaked","evidence":["src/main.rs:1"],"suggested_next_objective":null}],"unreviewed_required_scope":[],"verdict":"approved"}"##,
+fn reviewer_approval_requires_complete_explicit_review_contract() {
+    let empty_approval: ReviewRunResult = serde_json::from_str(
+        r##"{"source_coverage":[],"target_revision":3,"observed_reality_version":"sha256:reality","scope":"whole_project","reviewed_scope":[],"checks":[],"evidence":[],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}"##,
     )
     .unwrap();
-    assert!(invalid.validate().is_err());
+    assert!(empty_approval.validate().is_err());
+
+    let bounded_approval: ReviewRunResult = serde_json::from_str(
+        r##"{"source_coverage":[],"target_revision":3,"observed_reality_version":"sha256:reality","scope":"bounded_objective","reviewed_scope":["src"],"checks":["cargo test"],"evidence":["test output"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}"##,
+    )
+    .unwrap();
+    assert!(bounded_approval.validate().is_err());
 
     let valid: ReviewRunResult = serde_json::from_str(
-        r##"{"source_coverage":[],"reviewed_scope":["complete project"],"checks":["cargo test"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}"##,
+        r##"{"source_coverage":[],"target_revision":3,"observed_reality_version":"sha256:reality","scope":"whole_project","reviewed_scope":["complete project"],"checks":["cargo test"],"evidence":["all workspace tests passed"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}"##,
     )
     .unwrap();
     assert_eq!(valid.validate(), Ok(()));
+}
+
+#[test]
+fn reviewer_contract_requires_revision_reality_and_scope_fields() {
+    let legacy = r##"{"source_coverage":[],"reviewed_scope":["complete project"],"checks":["cargo test"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}"##;
+    assert!(serde_json::from_str::<ReviewRunResult>(legacy).is_err());
 }
 
 #[test]

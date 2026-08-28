@@ -161,6 +161,7 @@ CURRENT REVIEW FINDINGS:
 
 pub(crate) fn review_prompt(
     revision: u64,
+    observed_reality_version: &str,
     source: &str,
     implementation: &ImplementationRunResult,
     authoritative_manifest: &str,
@@ -175,9 +176,9 @@ Find every fault you can: omissions, incorrect behavior, architecture violations
 Read and hash every document in the authoritative bundle before review. Return exact path/hash pairs in source_coverage. Missing or changed coverage prohibits approval.
 
 Return ONLY one JSON object with this schema:
-{{"source_coverage":[{{"path":string,"content_hash":string}}],"reviewed_scope":[string],"checks":[string],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
+{{"source_coverage":[{{"path":string,"content_hash":string}}],"target_revision":number,"observed_reality_version":string,"scope":"whole_project","reviewed_scope":[string],"checks":[string],"evidence":[string],"findings":[{{"requirement":string,"fault":string,"evidence":[string],"suggested_next_objective":string|null}}],"unreviewed_required_scope":[string],"verdict":"findings"|"approved"}}
 
-Use verdict "approved" only when findings is empty, unreviewed_required_scope is empty, and you can find no fault in Project reality against this entire intent revision.
+Echo exactly target_revision {revision} and observed_reality_version "{observed_reality_version}". The Spoke independently verifies both bindings, exact canonical source coverage, and unchanged Project reality. Use verdict "approved" only when scope is whole_project, reviewed_scope, checks, and evidence are nonempty, findings and unreviewed_required_scope are empty, and the evidence supports finding no fault in Project reality against this entire intent revision.
 
 SOURCE OF INTENT revision {revision}:
 {source}
@@ -215,8 +216,12 @@ mod tests {
         machine
             .review_completed(ReviewRunResult {
                 source_coverage: vec![],
+                target_revision: 4,
+                observed_reality_version: "reality-1".into(),
+                scope: pumpkinpi_protocol::ReviewScope::WholeProject,
                 reviewed_scope: vec!["workspace".into()],
                 checks: vec![],
+                evidence: vec![],
                 findings: vec![ReviewFindingProposal {
                     requirement: "durable replay".into(),
                     fault: "restart loses cursor".into(),
@@ -239,8 +244,12 @@ mod tests {
         machine
             .review_completed(ReviewRunResult {
                 source_coverage: vec![],
+                target_revision: 4,
+                observed_reality_version: "reality-1".into(),
+                scope: pumpkinpi_protocol::ReviewScope::WholeProject,
                 reviewed_scope: vec!["complete project".into()],
                 checks: vec!["cargo test --workspace".into()],
+                evidence: vec!["workspace test output: passed".into()],
                 findings: vec![],
                 unreviewed_required_scope: vec![],
                 verdict: ReviewVerdict::Approved,
@@ -257,8 +266,12 @@ mod tests {
             machine
                 .review_completed(ReviewRunResult {
                     source_coverage: vec![],
+                    target_revision: 9,
+                    observed_reality_version: "reality-1".into(),
+                    scope: pumpkinpi_protocol::ReviewScope::WholeProject,
                     reviewed_scope: vec!["complete project".into()],
                     checks: vec![],
+                    evidence: vec![],
                     findings: vec![ReviewFindingProposal {
                         requirement: "still exact".into(),
                         fault: format!("fault {expected_iteration}"),

@@ -163,6 +163,46 @@ fn interrupted_isolated_realization_is_queued_for_checkpoint_recovery() {
     );
 }
 
+#[test]
+fn promotion_requires_canonical_coverage_revision_and_observed_reality_binding() {
+    let bundle = SourceOfIntentBundle {
+        manifest_path: "design.md".into(),
+        bundle_hash: "bundle".into(),
+        documents: vec![SourceDocument {
+            path: "design.md".into(),
+            content_hash: "canonical-hash".into(),
+            byte_len: 7,
+            content: "# Intent".into(),
+        }],
+    };
+    let review = ReviewRunResult {
+        source_coverage: source_bundle::coverage(&bundle),
+        target_revision: 3,
+        observed_reality_version: "reality-3".into(),
+        scope: ReviewScope::WholeProject,
+        reviewed_scope: vec!["all project files and required behavior".into()],
+        checks: vec!["cargo test --workspace".into()],
+        evidence: vec!["workspace suite passed".into()],
+        findings: vec![],
+        unreviewed_required_scope: vec![],
+        verdict: ReviewVerdict::Approved,
+    };
+
+    assert!(validate_review_for_promotion(&review, 3, "reality-3", Some(&bundle)).is_ok());
+
+    let mut stale = review.clone();
+    stale.target_revision = 2;
+    assert!(validate_review_for_promotion(&stale, 3, "reality-3", Some(&bundle)).is_err());
+
+    let mut wrong_reality = review.clone();
+    wrong_reality.observed_reality_version = "model-claimed-reality".into();
+    assert!(validate_review_for_promotion(&wrong_reality, 3, "reality-3", Some(&bundle)).is_err());
+
+    let mut incomplete = review;
+    incomplete.source_coverage.clear();
+    assert!(validate_review_for_promotion(&incomplete, 3, "reality-3", Some(&bundle)).is_err());
+}
+
 #[tokio::test]
 async fn active_intent_iterates_through_independent_review_to_satisfaction() {
     let dir = std::env::temp_dir().join(format!("pumpkinpi-orchestrator-test-{}", Uuid::new_v4()));
@@ -210,7 +250,8 @@ case "$request" in
     result='{"acts":["reference_context"],"source_coverage":__COVERAGE__,"projection":"Intent adopted.","question":null,"source_update":{"base_revision":0,"canonical_payload":"# Intent\\n\\nImplement and validate the fixture completely.","activate":true},"assumptions":[]}'
     ;;
   *"independent whole-Project reviewer"*)
-    result='{"source_coverage":__COVERAGE__,"reviewed_scope":["complete project"],"checks":["fixture inspection"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
+    reality=$(printf '%s' "$request" | sed -n 's/.*observed_reality_version [^0-9a-f]*\([0-9a-f]\{64\}\).*/\1/p')
+    result='{"source_coverage":__COVERAGE__,"target_revision":1,"observed_reality_version":"'"$reality"'","scope":"whole_project","reviewed_scope":["complete project"],"checks":["fixture inspection"],"evidence":["README.md and design.md inspected"],"findings":[],"unreviewed_required_scope":[],"verdict":"approved"}'
     ;;
   *)
     result='{"source_coverage":__COVERAGE__,"objective":"verify fixture","summary":"Fixture conforms.","observations":["README exists"],"changes":[],"validation":["fixture inspected"],"evidence":["README.md"],"residual_divergence":[],"question":null}'
