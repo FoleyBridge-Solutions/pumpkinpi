@@ -88,6 +88,7 @@ struct PendingMessage {
 struct DiagnosticView {
     message: String,
     created_at: u64,
+    sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +129,7 @@ struct AppStore {
     interactions: BTreeMap<(OperationId, String), InteractionView>,
     path_suggestions: BTreeMap<SpokeId, Vec<String>>,
     diagnostics: Vec<DiagnosticView>,
+    next_diagnostic_sequence: u64,
     pending_local_project: Option<(String, Option<String>)>,
 }
 
@@ -146,6 +148,7 @@ impl Default for AppStore {
             interactions: BTreeMap::new(),
             path_suggestions: BTreeMap::new(),
             diagnostics: Vec::new(),
+            next_diagnostic_sequence: 0,
             pending_local_project: None,
         }
     }
@@ -153,6 +156,28 @@ impl Default for AppStore {
 
 impl AppStore {
     fn view(&self) -> UiState {
+        let mut selected_snapshot = self
+            .selected
+            .as_ref()
+            .and_then(|key| self.snapshots.get(key).cloned());
+        if let Some(snapshot) = &mut selected_snapshot {
+            order_snapshot_collections(snapshot);
+        }
+        let mut interactions: Vec<_> = self.interactions.values().cloned().collect();
+        interactions.sort_by(|a, b| {
+            (a.created_at, &a.operation_id, &a.request_id).cmp(&(
+                b.created_at,
+                &b.operation_id,
+                &b.request_id,
+            ))
+        });
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.sort_by(|a, b| {
+            (a.created_at, &a.message, a.sequence).cmp(&(b.created_at, &b.message, b.sequence))
+        });
+        if diagnostics.len() > 100 {
+            diagnostics.drain(..diagnostics.len() - 100);
+        }
         UiState {
             connection: self.connection.clone(),
             configured: self.configured,
@@ -160,14 +185,11 @@ impl AppStore {
             spokes: self.spokes.values().cloned().collect(),
             projects: self.projects.values().cloned().collect(),
             selected: self.selected.clone(),
-            selected_snapshot: self
-                .selected
-                .as_ref()
-                .and_then(|key| self.snapshots.get(key).cloned()),
+            selected_snapshot,
             pending_messages: self.pending_messages.clone(),
-            interactions: self.interactions.values().cloned().collect(),
+            interactions,
             path_suggestions: self.path_suggestions.clone(),
-            diagnostics: self.diagnostics.iter().rev().take(100).cloned().collect(),
+            diagnostics,
         }
     }
 
@@ -177,9 +199,12 @@ impl AppStore {
     }
 
     fn diagnostic_at(&mut self, created_at: u64, message: impl Into<String>) {
+        let sequence = self.next_diagnostic_sequence;
+        self.next_diagnostic_sequence = self.next_diagnostic_sequence.saturating_add(1);
         self.diagnostics.push(DiagnosticView {
             message: message.into(),
             created_at,
+            sequence,
         });
         if self.diagnostics.len() > 500 {
             self.diagnostics.drain(..100);
@@ -337,7 +362,7 @@ impl GuiRuntime {
             store
                 .snapshots
                 .get(&key)
-                .and_then(|snapshot| snapshot.timeline.last().map(|item| item.cursor))
+                .and_then(|snapshot| snapshot.timeline.iter().map(|item| item.cursor).max())
         };
         self.emit();
         self.dispatch(ClientCommand::IntentSubscribe {
@@ -478,7 +503,7 @@ impl GuiRuntime {
                         .any(|existing| existing.timeline_item_id == item.timeline_item_id)
                 {
                     snapshot.timeline.push(item);
-                    snapshot.timeline.sort_by_key(|entry| entry.cursor);
+                    order_snapshot_collections(snapshot);
                 }
                 store.pending_messages.retain(|pending| {
                     pending.spoke_id != key.spoke_id || pending.project_id != key.project_id
@@ -788,6 +813,22 @@ fn project_key(project: &ProjectRecord) -> ProjectKey {
     }
 }
 
+fn order_snapshot_collections(snapshot: &mut ProjectSnapshot) {
+    snapshot.timeline.sort_by(|a, b| {
+        (a.created_at, a.cursor, &a.timeline_item_id).cmp(&(
+            b.created_at,
+            b.cursor,
+            &b.timeline_item_id,
+        ))
+    });
+    snapshot
+        .operations
+        .sort_by(|a, b| (a.updated_at, &a.operation_id).cmp(&(b.updated_at, &b.operation_id)));
+    snapshot
+        .reviews
+        .sort_by(|a, b| (a.created_at, &a.review_id).cmp(&(b.created_at, &b.review_id)));
+}
+
 fn merge_snapshot(old: &mut ProjectSnapshot, new: &ProjectSnapshot) {
     old.project = new.project.clone();
     old.source = new.source.clone();
@@ -801,10 +842,10 @@ fn merge_snapshot(old: &mut ProjectSnapshot, new: &ProjectSnapshot) {
             old.timeline.push(item.clone());
         }
     }
-    old.timeline.sort_by_key(|item| item.cursor);
     old.operations = new.operations.clone();
     old.reviews = new.reviews.clone();
     old.gap_before = new.gap_before;
+    order_snapshot_collections(old);
 }
 
 fn enum_class(value: &impl std::fmt::Debug) -> String {
@@ -1120,6 +1161,74 @@ fn app() -> Element {
     }
 }
 
+#[derive(Debug, Clone)]
+enum ChatLogEntry {
+    Timeline(TimelineItem),
+    Pending(PendingMessage),
+}
+
+fn ordered_chat_entries(
+    snapshot: &ProjectSnapshot,
+    pending_messages: &[PendingMessage],
+    key: &ProjectKey,
+) -> Vec<ChatLogEntry> {
+    let mut entries: Vec<_> = snapshot
+        .timeline
+        .iter()
+        .cloned()
+        .map(ChatLogEntry::Timeline)
+        .chain(
+            pending_messages
+                .iter()
+                .filter(|message| {
+                    message.spoke_id == key.spoke_id && message.project_id == key.project_id
+                })
+                .cloned()
+                .map(ChatLogEntry::Pending),
+        )
+        .collect();
+    entries.sort_by(|a, b| {
+        let created_at = |entry: &ChatLogEntry| match entry {
+            ChatLogEntry::Timeline(item) => item.created_at,
+            ChatLogEntry::Pending(message) => message.created_at,
+        };
+        created_at(a)
+            .cmp(&created_at(b))
+            .then_with(|| match (a, b) {
+                (ChatLogEntry::Timeline(a), ChatLogEntry::Timeline(b)) => {
+                    (a.cursor, &a.timeline_item_id).cmp(&(b.cursor, &b.timeline_item_id))
+                }
+                (ChatLogEntry::Timeline(_), ChatLogEntry::Pending(_)) => std::cmp::Ordering::Less,
+                (ChatLogEntry::Pending(_), ChatLogEntry::Timeline(_)) => {
+                    std::cmp::Ordering::Greater
+                }
+                (ChatLogEntry::Pending(a), ChatLogEntry::Pending(b)) => a.local_id.cmp(&b.local_id),
+            })
+    });
+    entries
+}
+
+fn render_chat_log_entry(entry: &ChatLogEntry) -> Element {
+    match entry {
+        ChatLogEntry::Timeline(item) => render_timeline_item(item),
+        ChatLogEntry::Pending(message) => {
+            let timestamp = format_local_timestamp(message.created_at);
+            rsx! {
+                article { class: "timeline-item user_intent pending-item", key: "{message.local_id}",
+                    div { class: "timeline-body",
+                        div { class: "timeline-meta",
+                            b { "You" }
+                            time { datetime: "{timestamp}", "{timestamp}" }
+                            span { class: "pending-dot" }
+                        }
+                        div { class: "timeline-content", "{message.message}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_chat(
     snapshot: &ProjectSnapshot,
     view: &UiState,
@@ -1140,10 +1249,7 @@ fn render_chat(
     let active_interactions = view.interactions.iter().filter(|interaction| {
         interaction.spoke_id == key.spoke_id && interaction.project_id == key.project_id
     });
-    let pending = view
-        .pending_messages
-        .iter()
-        .filter(|message| message.spoke_id == key.spoke_id && message.project_id == key.project_id);
+    let chat_entries = ordered_chat_entries(snapshot, &view.pending_messages, &key);
     let send_disabled = composer().trim().is_empty();
     let send_runtime = runtime.clone();
     let send_key = key.clone();
@@ -1174,28 +1280,11 @@ fn render_chat(
                 div { class: "context-warning", "Some earlier timeline detail is unavailable before cursor {gap}. The current project snapshot remains authoritative." }
             }
             div { class: "timeline",
-                if snapshot.timeline.is_empty() {
+                if chat_entries.is_empty() {
                     div { class: "timeline-empty", "Describe what should change to begin this Intent Chat." }
                 }
-                for item in &snapshot.timeline {
-                    {render_timeline_item(item)}
-                }
-                for message in pending {
-                    {
-                        let timestamp = format_local_timestamp(message.created_at);
-                        rsx! {
-                            article { class: "timeline-item user_intent pending-item", key: "{message.local_id}",
-                                div { class: "timeline-body",
-                                    div { class: "timeline-meta",
-                                        b { "You" }
-                                        time { datetime: "{timestamp}", "{timestamp}" }
-                                        span { class: "pending-dot" }
-                                    }
-                                    div { class: "timeline-content", "{message.message}" }
-                                }
-                            }
-                        }
-                    }
+                for entry in &chat_entries {
+                    {render_chat_log_entry(entry)}
                 }
             }
             div { class: "interaction-stack",
@@ -1385,7 +1474,7 @@ fn render_inspector(
                     if snapshot.operations.is_empty() {
                         div { class: "inspector-empty compact", "No operations yet. Send an intent to begin work." }
                     }
-                    for operation in snapshot.operations.iter().rev() {
+                    for operation in &snapshot.operations {
                         {
                             let runtime = runtime.clone();
                             let cancel_operation = operation.clone();
@@ -1423,7 +1512,7 @@ fn render_inspector(
     let latest_review = snapshot
         .reviews
         .iter()
-        .max_by_key(|review| review.created_at);
+        .max_by(|a, b| (a.created_at, &a.review_id).cmp(&(b.created_at, &b.review_id)));
     let provider = snapshot
         .project
         .default_provider
@@ -1633,7 +1722,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::format_timestamp;
+    use super::*;
     use chrono::FixedOffset;
 
     const FIXED_INSTANT: u64 = 1_704_164_645; // 2024-01-02 03:04:05 UTC
@@ -1656,6 +1745,202 @@ mod tests {
             format_timestamp(FIXED_INSTANT, &timezone),
             "2024-01-01 20:04:05 -07:00"
         );
+    }
+
+    fn timeline(id: &str, cursor: u64, created_at: u64) -> TimelineItem {
+        TimelineItem {
+            timeline_item_id: TimelineItemId(id.into()),
+            spoke_id: SpokeId("spoke".into()),
+            project_id: ProjectId("project".into()),
+            intent_chat_id: IntentChatId("chat".into()),
+            operation_id: None,
+            session_id: None,
+            run_id: None,
+            source_of_intent_revision: Some(1),
+            kind: TimelineKind::Progress,
+            visibility: Visibility::Primary,
+            status: None,
+            summary: None,
+            content: Some(id.into()),
+            cursor,
+            created_at,
+            updated_at: created_at,
+            completed_at: None,
+        }
+    }
+
+    fn operation(id: &str, updated_at: u64) -> OperationRecord {
+        OperationRecord {
+            operation_id: OperationId(id.into()),
+            request_id: None,
+            spoke_id: SpokeId("spoke".into()),
+            project_id: ProjectId("project".into()),
+            intent_chat_id: IntentChatId("chat".into()),
+            source_of_intent_revision: Some(1),
+            kind: "test".into(),
+            status: OperationStatus::Running,
+            error: None,
+            created_at: 1,
+            updated_at,
+            completed_at: None,
+        }
+    }
+
+    fn snapshot() -> ProjectSnapshot {
+        let project_id = ProjectId("project".into());
+        let spoke_id = SpokeId("spoke".into());
+        let chat_id = IntentChatId("chat".into());
+        ProjectSnapshot {
+            project: ProjectRecord {
+                project_id: project_id.clone(),
+                spoke_id: spoke_id.clone(),
+                name: "project".into(),
+                cwd: "/tmp/project".into(),
+                source_of_intent_id: SourceOfIntentId("source".into()),
+                intent_chat_id: chat_id.clone(),
+                initialization_status: InitializationStatus::Ready,
+                default_provider: None,
+                default_model: None,
+                run_as_user: None,
+                allow_root_sessions: false,
+                status: ProjectStatus::Active,
+                trusted: true,
+                realization_status: RealizationStatus::Inactive,
+                created_at: 1,
+                updated_at: 1,
+            },
+            source: SourceOfIntentMetadata {
+                source_of_intent_id: SourceOfIntentId("source".into()),
+                spoke_id: spoke_id.clone(),
+                project_id: project_id.clone(),
+                format: "markdown.v1".into(),
+                revision: 1,
+                content_hash: "hash".into(),
+                authoritative_bundle_hash: None,
+                authoritative_document_count: 0,
+                status: SourceStatus::Active,
+                created_at: 1,
+                updated_at: 1,
+            },
+            chat: IntentChatRecord {
+                intent_chat_id: chat_id,
+                spoke_id,
+                project_id,
+                source_of_intent_revision: 1,
+                status: IntentStatus::Ready,
+                next_cursor: 1,
+                created_at: 1,
+                updated_at: 1,
+                last_active_at: 1,
+            },
+            timeline: vec![],
+            operations: vec![],
+            reviews: vec![],
+            gap_before: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_logs_sort_by_authoritative_timestamp_then_stable_id() {
+        let mut snapshot = snapshot();
+        snapshot.timeline = vec![
+            timeline("item_z", 4, 20),
+            timeline("item_b", 3, 10),
+            timeline("item_a", 3, 10),
+        ];
+        snapshot.operations = vec![
+            operation("operation_z", 20),
+            operation("operation_b", 10),
+            operation("operation_a", 10),
+        ];
+
+        order_snapshot_collections(&mut snapshot);
+
+        assert_eq!(
+            snapshot
+                .timeline
+                .iter()
+                .map(|item| item.timeline_item_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["item_a", "item_b", "item_z"]
+        );
+        assert_eq!(
+            snapshot
+                .operations
+                .iter()
+                .map(|operation| operation.operation_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["operation_a", "operation_b", "operation_z"]
+        );
+    }
+
+    #[test]
+    fn view_sorts_interactions_and_diagnostics_independent_of_map_or_arrival_order() {
+        let mut store = AppStore::default();
+        for (operation_id, request_id, created_at) in [
+            ("operation_z", "request_z", 20),
+            ("operation_a", "request_b", 10),
+            ("operation_a", "request_a", 10),
+        ] {
+            let operation_id = OperationId(operation_id.into());
+            store.interactions.insert(
+                (operation_id.clone(), request_id.into()),
+                InteractionView {
+                    spoke_id: SpokeId("spoke".into()),
+                    project_id: ProjectId("project".into()),
+                    operation_id,
+                    request_id: request_id.into(),
+                    method: "confirm".into(),
+                    payload: Value::Null,
+                    created_at,
+                },
+            );
+        }
+        store.diagnostic_at(20, "later");
+        store.diagnostic_at(10, "same-z");
+        store.diagnostic_at(10, "same-a");
+
+        let view = store.view();
+
+        assert_eq!(
+            view.interactions
+                .iter()
+                .map(|interaction| interaction.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["request_a", "request_b", "request_z"]
+        );
+        assert_eq!(
+            view.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["same-a", "same-z", "later"]
+        );
+    }
+
+    #[test]
+    fn intent_log_merges_pending_messages_into_timestamp_order() {
+        let mut snapshot = snapshot();
+        snapshot.timeline = vec![timeline("item_later", 2, 20), timeline("item_first", 1, 10)];
+        let key = project_key(&snapshot.project);
+        let pending = vec![PendingMessage {
+            spoke_id: key.spoke_id.clone(),
+            project_id: key.project_id.clone(),
+            local_id: "pending_middle".into(),
+            message: "middle".into(),
+            created_at: 15,
+        }];
+
+        let entries = ordered_chat_entries(&snapshot, &pending, &key);
+        let labels = entries
+            .iter()
+            .map(|entry| match entry {
+                ChatLogEntry::Timeline(item) => item.timeline_item_id.0.as_str(),
+                ChatLogEntry::Pending(message) => message.local_id.as_str(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, ["item_first", "pending_middle", "item_later"]);
     }
 }
 

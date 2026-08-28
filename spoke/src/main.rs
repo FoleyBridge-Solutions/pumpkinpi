@@ -1963,27 +1963,39 @@ async fn snapshot(state: &State, pid: &ProjectId, cursor: Option<u64>) -> Result
     let all = s.timelines.get(pid).cloned().unwrap_or_default();
     let available = all.first().map(|x| x.cursor).unwrap_or(1);
     let gap = cursor.filter(|c| *c + 1 < available);
-    let timeline = all
+    let mut timeline: Vec<_> = all
         .into_iter()
         .filter(|x| cursor.is_none_or(|c| x.cursor > c))
         .collect();
+    timeline.sort_by(|a, b| {
+        (a.created_at, a.cursor, &a.timeline_item_id).cmp(&(
+            b.created_at,
+            b.cursor,
+            &b.timeline_item_id,
+        ))
+    });
+    let mut operations: Vec<_> = s
+        .operations
+        .values()
+        .filter(|x| &x.project_id == pid)
+        .cloned()
+        .collect();
+    operations
+        .sort_by(|a, b| (a.updated_at, &a.operation_id).cmp(&(b.updated_at, &b.operation_id)));
+    let mut reviews: Vec<_> = s
+        .reviews
+        .values()
+        .filter(|x| &x.project_id == pid)
+        .cloned()
+        .collect();
+    reviews.sort_by(|a, b| (a.created_at, &a.review_id).cmp(&(b.created_at, &b.review_id)));
     Ok(ProjectSnapshot {
         project: s.projects.get(pid).context("project not found")?.clone(),
         source: SourceOfIntentMetadata::from(s.sources.get(pid).context("source unavailable")?),
         chat: s.chats.get(pid).context("chat unavailable")?.clone(),
         timeline,
-        operations: s
-            .operations
-            .values()
-            .filter(|x| &x.project_id == pid)
-            .cloned()
-            .collect(),
-        reviews: s
-            .reviews
-            .values()
-            .filter(|x| &x.project_id == pid)
-            .cloned()
-            .collect(),
+        operations,
+        reviews,
         gap_before: gap,
     })
 }
