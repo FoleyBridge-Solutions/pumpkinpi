@@ -519,6 +519,156 @@ fn spoke_issues_file_and_validation_obligations_from_reality() {
 }
 
 #[tokio::test]
+async fn review_run_cannot_mutate_checkpoint_or_host_tmp() {
+    let dir =
+        std::env::temp_dir().join(format!("pumpkinpi-review-sandbox-test-{}", Uuid::new_v4()));
+    let project_root = dir.join("project");
+    tokio::fs::create_dir_all(&project_root).await.unwrap();
+    tokio::fs::write(project_root.join("README.md"), "checkpoint\n")
+        .await
+        .unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "checkpoint",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&project_root)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+    }
+
+    let project_id = ProjectId("project_review_sandbox".into());
+    let operation_id = OperationId("operation_review_sandbox".into());
+    let workspace = workspace::prepare(
+        &dir.join("state"),
+        &project_id,
+        &operation_id,
+        &project_root,
+    )
+    .await
+    .unwrap();
+    let checkpoint_file = workspace.worktree_root.join("README.md");
+    let host_tmp_marker = dir.join("review-created-host-file");
+    let fake_pi = dir.join("mutation-attempting-pi");
+    tokio::fs::write(
+        &fake_pi,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+json.loads(sys.stdin.readline())
+failures = []
+for path in [os.path.join(os.getcwd(), "README.md"), os.environ["REVIEW_HOST_MARKER"]]:
+    try:
+        with open(path, "w", encoding="utf-8") as target:
+            target.write("reviewer mutation\n")
+    except OSError:
+        failures.append(path)
+print(json.dumps({"type":"message_end","message":{"content":"attempted mutations"}}), flush=True)
+print(json.dumps({"type":"agent_settled"}), flush=True)
+assessment = json.loads(sys.stdin.readline())
+assert assessment["id"] == "review-assessment"
+result = {"mutation_attempts": 2, "blocked": len(failures)}
+print(json.dumps({"type":"message_end","message":{"content":json.dumps(result)}}), flush=True)
+print(json.dumps({"type":"agent_settled"}), flush=True)
+"#,
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+    }
+
+    let spoke_id = SpokeId("spoke_test".into());
+    let project = ProjectRecord {
+        project_id: project_id.clone(),
+        spoke_id: spoke_id.clone(),
+        name: "review sandbox fixture".into(),
+        cwd: project_root.to_string_lossy().into_owned(),
+        source_of_intent_id: SourceOfIntentId("source_test".into()),
+        intent_chat_id: IntentChatId("chat_test".into()),
+        initialization_status: InitializationStatus::Ready,
+        default_provider: None,
+        default_model: None,
+        run_as_user: None,
+        allow_root_sessions: false,
+        status: ProjectStatus::Active,
+        trusted: true,
+        realization_status: RealizationStatus::Reviewing,
+        created_at: now(),
+        updated_at: now(),
+    };
+    let mut store = Store::default();
+    store.workspaces.insert(operation_id.clone(), workspace);
+    let state = State {
+        config: Config {
+            spoke_id,
+            hub_url: "http://unused".into(),
+            trusted_roots: vec![project_root.clone()],
+            max_runs_per_project: 1,
+            pi_binary: Some(fake_pi),
+        },
+        data_dir: dir.join("state"),
+        store: Arc::new(Mutex::new(store)),
+        project_lanes: Default::default(),
+        realization_lanes: Default::default(),
+        cancellations: Default::default(),
+        interactions: Default::default(),
+    };
+    let (tx, _events) = mpsc::unbounded_channel();
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let mut provider_env = BTreeMap::new();
+    provider_env.insert(
+        "REVIEW_HOST_MARKER".into(),
+        host_tmp_marker.to_string_lossy().into_owned(),
+    );
+
+    let output = run_pi(
+        &state,
+        &tx,
+        &operation_id,
+        &RunId("run_review_sandbox".into()),
+        &project,
+        SessionPurpose::Review,
+        "Review without modifying anything.",
+        cancel_rx,
+        &provider_env,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output.text).unwrap(),
+        json!({"mutation_attempts": 2, "blocked": 2})
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&checkpoint_file).await.unwrap(),
+        "checkpoint\n"
+    );
+    assert!(!host_tmp_marker.exists());
+    let _ = tokio::fs::remove_dir_all(dir).await;
+}
+
+#[tokio::test]
 async fn active_intent_iterates_through_independent_review_to_satisfaction() {
     let dir = std::env::temp_dir().join(format!("pumpkinpi-orchestrator-test-{}", Uuid::new_v4()));
     let project_root = dir.join("project");

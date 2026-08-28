@@ -2032,34 +2032,50 @@ async fn run_pi(
     } else {
         None
     };
+    let sandbox_tmp = state
+        .data_dir
+        .join("sandboxes")
+        .join(&operation.0)
+        .join(format!("tmp-{}", run_id.0));
+    tokio::fs::create_dir_all(&sandbox_tmp)
+        .await
+        .context("failed to create private Pi scratch mountpoint")?;
+
     let mut cmd = Command::new("bwrap");
     cmd.args([
         "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
         "--ro-bind",
         "/",
         "/",
-        "--dev-bind",
-        "/dev",
+        "--dev",
         "/dev",
         "--proc",
         "/proc",
-        "--bind",
-        "/tmp",
-        "/tmp",
     ]);
+    // Keep scratch writes ephemeral and scoped to this Run. In particular, never expose the
+    // host's shared /tmp as writable to a reviewer.
+    cmd.arg("--tmpfs").arg(&sandbox_tmp);
+    cmd.env("TMPDIR", &sandbox_tmp);
     if let Some(agent) = &isolated_agent {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .context("HOME is required")?;
-        cmd.arg("--bind").arg(agent).arg(home.join(".pi/agent"));
+        cmd.arg(if purpose == SessionPurpose::Review {
+            "--ro-bind"
+        } else {
+            "--bind"
+        })
+        .arg(agent)
+        .arg(home.join(".pi/agent"));
     }
     let sandbox_cwd = if let Some(workspace) = &isolated {
         let writable = matches!(
             purpose,
-            SessionPurpose::Implementation
-                | SessionPurpose::Validation
-                | SessionPurpose::Review
-                | SessionPurpose::Recovery
+            SessionPurpose::Implementation | SessionPurpose::Validation | SessionPurpose::Recovery
         );
         cmd.arg(if writable { "--bind" } else { "--ro-bind" })
             .arg(&workspace.worktree_root)
